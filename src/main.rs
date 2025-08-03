@@ -47,6 +47,7 @@ struct DebugInfo {
 // Mach-Oセクションヘッダー構造体（64bit）
 #[repr(C)]
 #[derive(Debug)]
+#[allow(dead_code)]
 struct Section64 {
     sectname: [u8; 16],    // セクション名
     segname: [u8; 16],     // セグメント名
