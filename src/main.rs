@@ -1,357 +1,892 @@
+#![allow(dead_code, unused_variables, unused_mut, clippy::identity_op)]
+
+use std::collections::HashMap;
 use std::env;
+use std::error::Error;
+use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read};
-use std::path::Path;
+use std::mem;
+use std::os::raw::c_char;
+use std::str;
 
-// Mach-Oヘッダー構造体（64bit）
-#[repr(C)]
-#[derive(Debug)]
-struct MachHeader64 {
-    magic: u32,        // マジックナンバー
-    cputype: u32,      // CPUタイプ
-    cpusubtype: u32,   // CPUサブタイプ
-    filetype: u32,     // ファイルタイプ
-    ncmds: u32,        // ロードコマンド数
-    sizeofcmds: u32,   // ロードコマンドのサイズ
-    flags: u32,        // フラグ
-    reserved: u32,     // 予約済み（64bitのみ）
+use gimli::{DebugAbbrev, DebugInfo, DebugLine, DebugStr, EndianSlice, LittleEndian, Reader};
+use mach_o_sys::loader::*;
+
+#[derive(Debug, Clone)]
+pub struct SectionInfo {
+    pub name: String,
+    pub seg_name: String,
+    pub offset: u64,
+    pub size: u64,
+    pub addr: u64,
 }
 
-// セクション情報構造体（簡略化版）
-#[derive(Debug)]
-struct SectionInfo {
-    name: String,          // セクション名
-    addr: u64,             // 仮想アドレス
-    size: u64,             // セクションサイズ
-    offset: u32,           // ファイル内オフセット
-}
-
-// シンボルテーブル情報構造体
+/*
 #[derive(Debug)]
 struct SymtabInfo {
-    symoff: u32,           // シンボルテーブルオフセット
-    nsyms: u32,            // シンボル数
-    stroff: u32,           // 文字列テーブルオフセット
-    strsize: u32,          // 文字列テーブルサイズ
+    symoff: u32,
+    nsyms: u32,
+    stroff: u32,
+    strsize: u32,
 }
-
-// デバッグ情報構造体
-#[derive(Debug)]
-struct DebugInfo {
-    dwarf_sections: Vec<SectionInfo>,  // DWARFセクション
-    symtab_info: Option<SymtabInfo>,        // シンボルテーブル
-}
-
-
-
-// Mach-Oセクションヘッダー構造体（64bit）
-#[repr(C)]
-#[derive(Debug)]
-#[allow(dead_code)]
-struct Section64 {
-    sectname: [u8; 16],    // セクション名
-    segname: [u8; 16],     // セグメント名
-    addr: u64,             // 仮想アドレス
-    size: u64,             // セクションサイズ
-    offset: u32,           // ファイル内オフセット
-    align: u32,            // アライメント
-    reloff: u32,           // 再配置エントリオフセット
-    nreloc: u32,           // 再配置エントリ数
-    flags: u32,            // フラグ
-    reserved1: u32,        // 予約済み1
-    reserved2: u32,        // 予約済み2
-    reserved3: u32,        // 予約済み3（64bitのみ）
-}
+*/
 
 fn main() -> io::Result<()> {
+    // ...（省略）
     let args: Vec<String> = env::args().collect();
-    
-    if args.len() != 2 {
-        eprintln!("使用方法: {} <実行可能ファイルのパス>", args[0]);
-        std::process::exit(1);
+    if args.len() < 3 {
+        println!("使用法: tsudump <ファイルパス> <コマンド>");
+        println!("コマンド:");
+        println!("  --header: Mach-Oヘッダ情報を表示");
+        println!("  --segments: セグメント情報を表示");
+        println!("  --symbols: シンボルテーブルを表示");
+        println!("  --disassemble: __textセクションを逆アセンブル");
+        println!("  --dump-data: __dataセクションをダンプ");
+        println!("  --debug-info: __debug_infoセクションを解析 (DWARF 2-5対応)");
+        println!("  --debug-abbrev: __debug_abbrevセクションを解析 (DWARF 2-5対応)");
+        println!("  --debug-aranges: __debug_arangesセクションを解析 (DWARF 2-5対応)");
+        println!("  --debug-line: __debug_lineセクションを解析 (DWARF 2-5対応)");
+        println!("  --debug-str-offsets: __debug_str_offsetsセクションを解析 (DWARF 5)");
+        println!("  --debug-addr: __debug_addrセクションを解析 (DWARF 5)");
+        println!("  --apple-names: __apple_namesセクションを16進ダンプ表示");
+        println!("  --stubs: __stubsセクションを16進ダンプ表示");
+        println!("  --stubs-follow: __stubs直後のセクションも自動ダンプ表示");
+        println!("  --unwind-info: __unwind_infoセクションを16進ダンプ表示");
+        println!("  --got: __gotセクションを16進ダンプ表示");
+        return Ok(());
     }
-    
+
     let file_path = &args[1];
-    
-    if !Path::new(file_path).exists() {
-        eprintln!("エラー: ファイル '{}' が見つかりません", file_path);
-        std::process::exit(1);
+    let command = &args[2];
+
+    let mut file = File::open(file_path)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+
+    let magic = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    let is_64 = magic == MH_MAGIC_64;
+    enum MachHeader<'a> {
+        Header32(&'a mach_o_sys::loader::mach_header),
+        Header64(&'a mach_header_64),
     }
-    
-    dump_file(file_path)?;
-    
+    let (sections, ncmds, macho_header) = if is_64 {
+        let header: &mach_header_64 = unsafe { &*(buffer.as_ptr() as *const mach_header_64) };
+        (parse_load_commands_64(&buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header64(header))
+    } else if magic == MH_MAGIC {
+        use mach_o_sys::loader::mach_header;
+        let header: &mach_header = unsafe { &*(buffer.as_ptr() as *const mach_header) };
+        (parse_load_commands_32(&buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header32(header))
+    } else {
+        println!("エラー: 未対応または不正なMach-Oファイルです (magic=0x{:08x})", magic);
+        return Ok(());
+    };
+
+    match command.as_str() {
+        "--cstring" => {
+            match find_section_by_name(&sections, "__cstring") {
+                Some(section) => display_cstring_section(&buffer, section),
+                None => println!("__cstringセクションが見つかりません"),
+            }
+            return Ok(());
+        }
+        "--unwind-info" => {
+            match find_section_by_name(&sections, "__unwind_info") {
+                Some(section) => display_unwind_info_section(&buffer, section),
+                None => println!("__unwind_infoセクションが見つかりません"),
+            }
+            return Ok(());
+        }
+        "--got" => {
+            match find_section_by_name(&sections, "__got") {
+                Some(section) => display_got_section(&buffer, section),
+                None => println!("__gotセクションが見つかりません"),
+            }
+            return Ok(());
+        }
+        "--stubs-follow" => {
+            display_stubs_and_following_section(&buffer, &sections);
+            return Ok(());
+        }
+        "--stubs" => {
+            match find_section_by_name(&sections, "__stubs") {
+                Some(section) => display_stubs_section(&buffer, section, is_64),
+                None => println!("__stubsセクションが見つかりません"),
+            }
+            return Ok(());
+        }
+        "--apple-names" => {
+            match find_section_by_name(&sections, "__apple_names") {
+                Some(section) => display_apple_names_section(&buffer, section),
+                None => println!("__apple_namesセクションが見つかりません"),
+            }
+            return Ok(());
+        }
+        "--header" => {
+            match macho_header {
+                MachHeader::Header64(header64) => display_macho_header(header64),
+                MachHeader::Header32(_) => println!("32ビットMach-Oのヘッダ表示は未対応です。"),
+            }
+        },
+        "--segments" => {
+            println!("セグメント情報:");
+            for section in sections.values() {
+                println!(
+                    "  セグメント: {}, セクション: {}, オフセット: 0x{:x}, サイズ: {}, アドレス: 0x{:x}",
+                    section.seg_name, section.name, section.offset, section.size, section.addr
+                );
+            }
+        }
+        "--symbols" => display_symbols(&buffer, &sections),
+        "--disassemble" => {
+            if let Some(text_section) = find_section_by_name(&sections, "__text") {
+                match macho_header {
+                    MachHeader::Header64(header64) => disassemble_text_section(&buffer, text_section, header64),
+                    MachHeader::Header32(_) => println!("32ビットMach-Oの逆アセンブルは未対応です。"),
+                }
+            } else {
+                println!("__textセクションが見つかりません");
+            }
+        },
+        "--dump-data" => {
+            let data_sections: Vec<&SectionInfo> = find_all_sections_in_segment(&sections, "__DATA");
+            let owned_sections: Vec<SectionInfo> = data_sections.into_iter().cloned().collect();
+            dump_data_sections(&buffer, &owned_sections);
+        },
+        "--debug-info" | "--debug-abbrev" | "--debug-aranges" | "--debug-line" | "--debug-str-offsets" | "--debug-addr" => {
+            let endian = LittleEndian;
+
+            let get_section_data = |name: &str| -> gimli::EndianSlice<LittleEndian> {
+                match find_section_by_name(&sections, name) {
+                    Some(section) => {
+                        let start = section.offset as usize;
+                        let end = start + section.size as usize;
+                        if end > buffer.len() {
+                            return EndianSlice::new(&[], endian);
+                        }
+                        EndianSlice::new(&buffer[start..end], endian)
+                    }
+                    None => EndianSlice::new(&[], endian),
+                }
+            };
+
+            let debug_info_data = get_section_data("__debug_info");
+            let debug_abbrev_data = get_section_data("__debug_abbrev");
+            let debug_line_data = get_section_data("__debug_line");
+            let debug_str_data = get_section_data("__debug_str");
+            let debug_aranges_data = get_section_data("__debug_aranges");
+            
+            // DWARF 5の新しいセクション
+            let debug_str_offsets_data = get_section_data("__debug_str_offsets");
+            let debug_addr_data = get_section_data("__debug_addr");
+            let debug_line_str_data = get_section_data("__debug_line_str");
+
+            let debug_info = DebugInfo::new(&debug_info_data, endian);
+            let debug_abbrev = DebugAbbrev::new(&debug_abbrev_data, endian);
+            let debug_line = DebugLine::new(&debug_line_data, endian);
+            let debug_str = DebugStr::new(&debug_str_data, endian);
+            let debug_aranges = gimli::DebugAranges::new(&debug_aranges_data, endian);
+            
+            // DWARF 5のセクション（gimli 0.28では直接作成）
+            let _debug_str_offsets = &debug_str_offsets_data;
+            let _debug_addr = &debug_addr_data;
+            let debug_line_str = gimli::DebugLineStr::new(&debug_line_str_data, endian);
+
+            // __TEXTセグメントのベースアドレスを取得
+            let text_base_addr = find_all_sections_in_segment(&sections, "__TEXT")
+                .iter()
+                .find(|s| s.name == "__text")
+                .map(|s| s.addr)
+                .unwrap_or(0);
+
+            let result = match command.as_str() {
+                "--debug-info" => {
+                    parse_and_display_debug_info(debug_info, debug_abbrev, debug_str, text_base_addr)
+                }
+                "--debug-abbrev" => {
+                    if let Some(section) = find_section_by_name(&sections, "__debug_abbrev") {
+                        let mut units = debug_info.units();
+                        if let Ok(Some(unit)) = units.next() {
+                             parse_and_display_debug_abbrev(&buffer, section, unit.version());
+                        } else {
+                            println!("__debug_infoからユニットを読み込めません");
+                        }
+                    } else {
+                        println!("__debug_abbrevセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                "--debug-aranges" => {
+                    if let Some(section) = find_section_by_name(&sections, "__debug_aranges") {
+                        parse_and_display_debug_aranges(&buffer, section);
+                    } else {
+                        println!("__debug_arangesセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                "--debug-line" => {
+                    display_debug_line_details_manual(&buffer, &sections);
+                    Ok(())
+                }
+                "--debug-str-offsets" => {
+                    if let Some(section) = find_section_by_name(&sections, "__debug_str_offsets") {
+                        parse_and_display_debug_str_offsets(&buffer, section);
+                    } else {
+                        println!("__debug_str_offsetsセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                "--debug-addr" => {
+                    if let Some(section) = find_section_by_name(&sections, "__debug_addr") {
+                        parse_and_display_debug_addr(&buffer, section);
+                    } else {
+                        println!("__debug_addrセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                _ => unreachable!(),
+            };
+
+            if let Err(e) = result {
+                println!("DWARF情報の解析中にエラーが発生しました: {}", e);
+            }
+            return Ok(());
+        }
+        _ => println!("不明なコマンドです: {}", command),
+    }
+
     Ok(())
 }
 
-fn is_macho_file(buffer: &[u8]) -> bool {
-    if buffer.len() < 4 {
-        return false;
-    }
-    
-    let magic_le = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    let magic_be = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
-    
-    // Mach-O 64bit マジックナンバーをチェック
-    magic_le == 0xcffaedfe || magic_be == 0xcffaedfe ||
-    magic_le == 0xfeedfacf || magic_be == 0xfeedfacf
+unsafe fn read_header(buffer: &[u8]) -> &mach_header_64 {
+    &*(buffer.as_ptr() as *const mach_header_64)
 }
 
-fn parse_macho_header(buffer: &[u8]) -> Option<MachHeader64> {
-    if !is_macho_file(buffer) || buffer.len() < 32 {
-        return None;
-    }
-    
-    // マジックナンバーを読み取ってエンディアンを判定
-    let magic_bytes = [buffer[0], buffer[1], buffer[2], buffer[3]];
-    let magic_le = u32::from_le_bytes(magic_bytes);
-    let magic_be = u32::from_be_bytes(magic_bytes);
-    
-    let (magic, is_little_endian) = if magic_le == 0xcffaedfe {
-        (magic_le, true)
-    } else if magic_be == 0xcffaedfe {
-        (magic_be, false)
-    } else if magic_le == 0xfeedfacf {
-        (magic_le, true)
-    } else if magic_be == 0xfeedfacf {
-        (magic_be, false)
-    } else {
-        return None;
-    };
-    
-    let read_u32 = |offset: usize| -> u32 {
-        let bytes = [buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]];
-        if is_little_endian {
-            u32::from_le_bytes(bytes)
-        } else {
-            u32::from_be_bytes(bytes)
-        }
-    };
-    
+fn parse_load_commands_64(buffer: &[u8], ncmds: usize) -> HashMap<String, SectionInfo> {
+    let mut sections = HashMap::new();
+    let header_size = mem::size_of::<mach_header_64>();
+    let mut offset = header_size;
 
-    Some(MachHeader64 {
-        magic,
-        cputype: read_u32(4),
-        cpusubtype: read_u32(8),
-        filetype: read_u32(12),
-        ncmds: read_u32(16),
-        sizeofcmds: read_u32(20),
-        flags: read_u32(24),
-        reserved: read_u32(28),
-    })
-}
-
-fn find_text_section(buffer: &[u8], header: &MachHeader64) -> Option<SectionInfo> {
-    find_section_in_segment(buffer, header, "__TEXT", "__text")
-}
-
-fn find_data_sections(buffer: &[u8], header: &MachHeader64) -> Vec<SectionInfo> {
-    find_all_sections_in_segment(buffer, header, "__DATA")
-}
-
-fn find_debug_info(buffer: &[u8], header: &MachHeader64) -> DebugInfo {
-    let mut debug_info = DebugInfo {
-        dwarf_sections: Vec::new(),
-        symtab_info: None,
-    };
-    
-    // __DWARFセグメントからDWARFセクションを検索
-    debug_info.dwarf_sections = find_all_sections_in_segment(buffer, header, "__DWARF");
-    
-    // シンボルテーブル情報を検索
-    debug_info.symtab_info = find_symtab_info(buffer, header);
-    
-    debug_info
-}
-
-fn find_symtab_info(buffer: &[u8], header: &MachHeader64) -> Option<SymtabInfo> {
-    let mut offset = 32; // Mach-O 64-bit ヘッダーサイズ
-    
-    for _ in 0..header.ncmds {
-        if offset + 8 > buffer.len() {
+    for _ in 0..ncmds {
+        if offset + mem::size_of::<load_command>() > buffer.len() {
             break;
         }
-        
-        let cmd = u32::from_le_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]]);
-        let cmdsize = u32::from_le_bytes([buffer[offset + 4], buffer[offset + 5], buffer[offset + 6], buffer[offset + 7]]);
-        
-        if cmd == 0x2 { // LC_SYMTAB
-            if offset + 24 > buffer.len() {
-                break;
-            }
-            
-            let symoff = u32::from_le_bytes([buffer[offset + 8], buffer[offset + 9], buffer[offset + 10], buffer[offset + 11]]);
-            let nsyms = u32::from_le_bytes([buffer[offset + 12], buffer[offset + 13], buffer[offset + 14], buffer[offset + 15]]);
-            let stroff = u32::from_le_bytes([buffer[offset + 16], buffer[offset + 17], buffer[offset + 18], buffer[offset + 19]]);
-            let strsize = u32::from_le_bytes([buffer[offset + 20], buffer[offset + 21], buffer[offset + 22], buffer[offset + 23]]);
-            
-            return Some(SymtabInfo {
-                symoff,
-                nsyms,
-                stroff,
-                strsize,
-            });
-        }
-        
-        offset += cmdsize as usize;
-    }
-    
-    None
-}
+        let lc: &load_command = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const load_command)
+        };
 
-fn find_section_in_segment(buffer: &[u8], header: &MachHeader64, segment_name: &str, section_name: &str) -> Option<SectionInfo> {
-    let mut offset = 32; // Mach-O 64-bit ヘッダーサイズ
-    
-    for _ in 0..header.ncmds {
-        if offset + 8 > buffer.len() {
-            break;
-        }
-        
-        let cmd = u32::from_le_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]]);
-        let cmdsize = u32::from_le_bytes([buffer[offset + 4], buffer[offset + 5], buffer[offset + 6], buffer[offset + 7]]);
-        
-        if cmd == 0x19 { // LC_SEGMENT_64
-            if offset + 72 > buffer.len() {
-                break;
-            }
-            
-            // セグメント名を読み取り（16バイト）
-            let segname = &buffer[offset + 8..offset + 24];
-            let segname_str = std::str::from_utf8(segname)
-                .unwrap_or("")
-                .trim_end_matches('\0');
-            
-            if segname_str == segment_name {
-                // セクション数を取得
-                let nsects = u32::from_le_bytes([buffer[offset + 64], buffer[offset + 65], buffer[offset + 66], buffer[offset + 67]]);
-                
-                // セクションヘッダーを読み取り
-                let mut section_offset = offset + 72;
-                for _ in 0..nsects {
-                    if section_offset + 80 > buffer.len() {
-                        break;
-                    }
-                    
-                    // セクション名を読み取り（16バイト）
-                    let sectname = &buffer[section_offset..section_offset + 16];
-                    let sectname_str = std::str::from_utf8(sectname)
-                        .unwrap_or("")
-                        .trim_end_matches('\0');
-                    
-                    if sectname_str == section_name {
-                        // セクション情報を取得
-                        let addr = u64::from_le_bytes([
-                            buffer[section_offset + 32], buffer[section_offset + 33],
-                            buffer[section_offset + 34], buffer[section_offset + 35],
-                            buffer[section_offset + 36], buffer[section_offset + 37],
-                            buffer[section_offset + 38], buffer[section_offset + 39],
-                        ]);
-                        let size = u64::from_le_bytes([
-                            buffer[section_offset + 40], buffer[section_offset + 41],
-                            buffer[section_offset + 42], buffer[section_offset + 43],
-                            buffer[section_offset + 44], buffer[section_offset + 45],
-                            buffer[section_offset + 46], buffer[section_offset + 47],
-                        ]);
-                        let file_offset = u32::from_le_bytes([
-                            buffer[section_offset + 48], buffer[section_offset + 49],
-                            buffer[section_offset + 50], buffer[section_offset + 51],
-                        ]);
-                        
-                        return Some(SectionInfo {
-                            name: sectname_str.to_string(),
-                            addr,
-                            size,
-                            offset: file_offset,
-                        });
-                    }
-                    
-                    section_offset += 80; // セクションヘッダーサイズ
+        if lc.cmd == LC_SEGMENT_64 as u32 {
+            let seg_cmd: &segment_command_64 = unsafe {
+                &*(buffer.as_ptr().add(offset) as *const segment_command_64)
+            };
+
+            let seg_name = unsafe {
+                CStr::from_ptr(seg_cmd.segname.as_ptr() as *const c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            let mut section_offset = offset + mem::size_of::<segment_command_64>();
+            for i in 0..seg_cmd.nsects as usize {
+                if section_offset + mem::size_of::<section_64>() > buffer.len() {
+                    break;
                 }
-            }
-        }
-        
-        offset += cmdsize as usize;
-    }
-    
-    None
-}
+                let sect: &section_64 = unsafe {
+                    &*(buffer.as_ptr().add(section_offset) as *const section_64)
+                };
 
-fn find_all_sections_in_segment(buffer: &[u8], header: &MachHeader64, segment_name: &str) -> Vec<SectionInfo> {
-    let mut sections = Vec::new();
-    let mut offset = 32; // Mach-O 64-bit ヘッダーサイズ
-    
-    for _ in 0..header.ncmds {
-        if offset + 8 > buffer.len() {
-            break;
-        }
-        
-        let cmd = u32::from_le_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]]);
-        let cmdsize = u32::from_le_bytes([buffer[offset + 4], buffer[offset + 5], buffer[offset + 6], buffer[offset + 7]]);
-        
-        if cmd == 0x19 { // LC_SEGMENT_64
-            if offset + 72 > buffer.len() {
-                break;
-            }
-            
-            // セグメント名を読み取り（16バイト）
-            let segname = &buffer[offset + 8..offset + 24];
-            let segname_str = std::str::from_utf8(segname)
-                .unwrap_or("")
-                .trim_end_matches('\0');
-            
-            if segname_str == segment_name {
-                // セクション数を取得
-                let nsects = u32::from_le_bytes([buffer[offset + 64], buffer[offset + 65], buffer[offset + 66], buffer[offset + 67]]);
-                
-                // セクションヘッダーを読み取り
-                let mut section_offset = offset + 72;
-                for _ in 0..nsects {
-                    if section_offset + 80 > buffer.len() {
-                        break;
-                    }
-                    
-                    // セクション名を読み取り（16バイト）
-                    let sectname = &buffer[section_offset..section_offset + 16];
-                    let sectname_str = std::str::from_utf8(sectname)
-                        .unwrap_or("")
-                        .trim_end_matches('\0');
-                    
-                    // セクション情報を取得
-                    let addr = u64::from_le_bytes([
-                        buffer[section_offset + 32], buffer[section_offset + 33],
-                        buffer[section_offset + 34], buffer[section_offset + 35],
-                        buffer[section_offset + 36], buffer[section_offset + 37],
-                        buffer[section_offset + 38], buffer[section_offset + 39],
-                    ]);
-                    let size = u64::from_le_bytes([
-                        buffer[section_offset + 40], buffer[section_offset + 41],
-                        buffer[section_offset + 42], buffer[section_offset + 43],
-                        buffer[section_offset + 44], buffer[section_offset + 45],
-                        buffer[section_offset + 46], buffer[section_offset + 47],
-                    ]);
-                    let file_offset = u32::from_le_bytes([
-                        buffer[section_offset + 48], buffer[section_offset + 49],
-                        buffer[section_offset + 50], buffer[section_offset + 51],
-                    ]);
-                    
-                    sections.push(SectionInfo {
-                        name: sectname_str.to_string(),
-                        addr,
-                        size,
-                        offset: file_offset,
-                    });
-                    
-                    section_offset += 80; // セクションヘッダーサイズ
-                }
+                let sect_name = unsafe {
+                    CStr::from_ptr(sect.sectname.as_ptr() as *const c_char)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+
+                let info = SectionInfo {
+                    name: sect_name.clone(),
+                    seg_name: seg_name.clone(),
+                    offset: sect.offset as u64,
+                    size: sect.size as u64,
+                    addr: sect.addr,
+                };
+                sections.insert(sect_name, info);
+                section_offset += mem::size_of::<section_64>();
             }
         }
-        
-        offset += cmdsize as usize;
+        offset += lc.cmdsize as usize;
     }
-    
     sections
 }
 
-fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &MachHeader64) {
+fn parse_load_commands_32(buffer: &[u8], ncmds: usize) -> HashMap<String, SectionInfo> {
+    use mach_o_sys::loader::{mach_header, segment_command, section, load_command};
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+    use std::mem;
+    let mut sections = HashMap::new();
+    let header_size = mem::size_of::<mach_header>();
+    let mut offset = header_size;
+    for _ in 0..ncmds {
+        if offset + mem::size_of::<load_command>() > buffer.len() {
+            break;
+        }
+        let lc: &load_command = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const load_command)
+        };
+        if lc.cmd == LC_SEGMENT as u32 {
+            let seg_cmd: &segment_command = unsafe {
+                &*(buffer.as_ptr().add(offset) as *const segment_command)
+            };
+            let seg_name = unsafe {
+                CStr::from_ptr(seg_cmd.segname.as_ptr() as *const c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let mut section_offset = offset + mem::size_of::<segment_command>();
+            for _ in 0..seg_cmd.nsects as usize {
+                if section_offset + mem::size_of::<section>() > buffer.len() {
+                    break;
+                }
+                let sect: &section = unsafe {
+                    &*(buffer.as_ptr().add(section_offset) as *const section)
+                };
+                let sect_name = unsafe {
+                    CStr::from_ptr(sect.sectname.as_ptr() as *const c_char)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let info = SectionInfo {
+                    name: sect_name.clone(),
+                    seg_name: seg_name.clone(),
+                    offset: sect.offset as u64,
+                    size: sect.size as u64,
+                    addr: sect.addr as u64,
+                };
+                sections.insert(sect_name, info);
+                section_offset += mem::size_of::<section>();
+            }
+        }
+        offset += lc.cmdsize as usize;
+    }
+    sections
+}
+
+fn find_section_by_name<'a>(
+    sections: &'a HashMap<String, SectionInfo>,
+    name: &str,
+) -> Option<&'a SectionInfo> {
+    sections.values().find(|s| s.name == name)
+}
+
+fn find_all_sections_in_segment<'a>(
+    sections: &'a HashMap<String, SectionInfo>,
+    seg_name: &str,
+) -> Vec<&'a SectionInfo> {
+    sections.values().filter(|s| s.seg_name == seg_name).collect()
+}
+
+
+fn parse_and_display_debug_info<R: Reader>(
+    debug_info: DebugInfo<R>,
+    debug_abbrev: DebugAbbrev<R>,
+    debug_str: DebugStr<R>,
+    text_base_addr: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut units = debug_info.units();
+    while let Some(unit) = units.next()? {
+        let abbrevs = unit.abbreviations(&debug_abbrev)?;
+        let dwarf_version = unit.version();
+        
+        // バージョン別の機能説明を表示
+        let version_features = match dwarf_version {
+            2 => "基本的なDWARF機能",
+            3 => "名前空間、インポートモジュール、制限型サポート",
+            4 => "型単位、部分単位、テンプレートエイリアスサポート",
+            5 => "文字列オフセット、アドレステーブル、呼び出しサイト情報サポート",
+            _ => "不明なバージョン",
+        };
+        
+        println!("\n.debug_info: unit at <.debug_info+0x{:?}> (DWARF version {} - {})",
+                 unit.offset(), dwarf_version, version_features);
+        
+        let mut entries = unit.entries(&abbrevs);
+        let mut depth = 0;
+
+        while let Some((delta_depth, entry)) = entries.next_dfs()? {
+            depth += delta_depth;
+            println!("<{}> <{:?}>", depth, entry.offset());
+
+            let tag_name = get_die_tag_name(entry.tag().0 as u64, dwarf_version);
+            println!("      TAG: {}", tag_name);
+
+            // DW_TAG_compile_unitの場合は特別な処理を行う
+            let is_compile_unit = entry.tag() == gimli::DW_TAG_compile_unit;
+            let mut low_pc: Option<u64> = None;
+            let mut high_pc_value: Option<gimli::AttributeValue<R>> = None;
+            let mut high_pc_attr_name: Option<gimli::DwAt> = None;
+
+            let mut attrs = entry.attrs();
+            while let Some(attr) = attrs.next()? {
+                let attr_name = get_attr_name(attr.name().0 as u64);
+                
+                // DW_AT_low_pcとDW_AT_high_pcを記録
+                if is_compile_unit {
+                    if attr.name() == gimli::DW_AT_low_pc {
+                        match attr.value() {
+                            gimli::AttributeValue::Addr(addr) => {
+                                // アドレスが相対的な場合はベースアドレスを加算
+                                low_pc = Some(if addr < 0x100000000 { addr + text_base_addr } else { addr });
+                            },
+                            gimli::AttributeValue::Udata(offset) => {
+                                low_pc = Some(offset + text_base_addr);
+                            },
+                            gimli::AttributeValue::Data4(offset) => {
+                                low_pc = Some(offset as u64 + text_base_addr);
+                            },
+                            gimli::AttributeValue::Data8(offset) => {
+                                low_pc = Some(offset + text_base_addr);
+                            },
+                            _ => {}
+                        }
+                    } else if attr.name() == gimli::DW_AT_high_pc {
+                        high_pc_value = Some(attr.value());
+                        high_pc_attr_name = Some(attr.name());
+                    }
+                }
+
+                // DW_AT_high_pcは後で特別処理するのでここではスキップ
+                if !(is_compile_unit && attr.name() == gimli::DW_AT_high_pc) {
+                    print!("        ATTR: {} ", attr_name);
+                    if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(attr.name(), attr.value(), &debug_str, text_base_addr) {
+                        println!("({})", val_str);
+                    } else {
+                        println!("(unhandled format)");
+                    }
+                }
+            }
+
+            // DW_TAG_compile_unitでDW_AT_high_pcが見つからない場合、追加情報を表示
+            if is_compile_unit {
+                if let (Some(low), Some(high_val), Some(_)) = (low_pc, high_pc_value, high_pc_attr_name) {
+                    match high_val {
+                        gimli::AttributeValue::Addr(addr) => {
+                            println!("        ATTR: DW_AT_high_pc (0x{:x} - 絶対アドレス)", addr);
+                        },
+                        gimli::AttributeValue::Udata(offset) => {
+                            let high_addr = low + offset;
+                            println!("        ATTR: DW_AT_high_pc (0x{:x} - low_pc + 0x{:x})", high_addr, offset);
+                        },
+                        gimli::AttributeValue::Data4(offset) => {
+                            let high_addr = low + offset as u64;
+                            println!("        ATTR: DW_AT_high_pc (0x{:x} - low_pc + 0x{:x})", high_addr, offset);
+                        },
+                        gimli::AttributeValue::Data8(offset) => {
+                            let high_addr = low + offset;
+                            println!("        ATTR: DW_AT_high_pc (0x{:x} - low_pc + 0x{:x})", high_addr, offset);
+                        },
+                        _ => {
+                            if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(gimli::DW_AT_high_pc, high_val, &debug_str, text_base_addr) {
+                                println!("        ATTR: DW_AT_high_pc ({})", val_str);
+                            }
+                        }
+                    }
+                } else if low_pc.is_some() {
+                    println!("        注意: DW_AT_low_pcは存在しますが、DW_AT_high_pcが見つかりません");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dwarf_attr_to_string<R: Reader>(
+    val: gimli::AttributeValue<R>,
+    debug_str: &DebugStr<R>,
+) -> Result<String, Box<dyn Error>> {
+    let s = match val {
+        gimli::AttributeValue::String(s) => format!("{:?}", s.to_string_lossy()?.into_owned()),
+        gimli::AttributeValue::DebugStrRef(offset) => {
+            format!("{:?}", debug_str.get_str(offset)?.to_string_lossy()?.into_owned())
+        }
+        gimli::AttributeValue::Udata(u) => format!("{}", u),
+        gimli::AttributeValue::Sdata(s) => format!("{}", s),
+        gimli::AttributeValue::Data1(d) => format!("0x{:x}", d),
+        gimli::AttributeValue::Data2(d) => format!("0x{:x}", d),
+        gimli::AttributeValue::Data4(d) => format!("0x{:x}", d),
+        gimli::AttributeValue::Data8(d) => format!("0x{:x}", d),
+        gimli::AttributeValue::Addr(addr) => format!("0x{:x}", addr),
+        gimli::AttributeValue::Flag(f) => format!("{}", f),
+        gimli::AttributeValue::Language(lang) => {
+            let lang_code = lang.0 as u64;
+            format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code))
+        },
+        gimli::AttributeValue::UnitRef(unit_ref) => format!("unit_ref: {:?}", unit_ref),
+        gimli::AttributeValue::DebugInfoRef(debug_info_ref) => format!("debug_info_ref: {:?}", debug_info_ref),
+        gimli::AttributeValue::SecOffset(offset) => format!("sec_offset: {:?}", offset),
+        gimli::AttributeValue::Exprloc(expr) => {
+            let slice = expr.0.to_slice()?;
+            format!("exprloc: {} bytes", slice.len())
+        },
+        gimli::AttributeValue::Block(block) => {
+            let slice = block.to_slice()?;
+            format!("block: {} bytes", slice.len())
+        },
+        _ => "<unhandled>".to_string(),
+    };
+    Ok(s)
+}
+
+fn dwarf_attr_to_string_with_context<R: Reader>(
+    attr_name: gimli::DwAt,
+    val: gimli::AttributeValue<R>,
+    debug_str: &DebugStr<R>,
+) -> Result<String, Box<dyn Error>> {
+    dwarf_attr_to_string_with_context_and_base(attr_name, val, debug_str, 0)
+}
+
+fn dwarf_attr_to_string_with_context_and_base<R: Reader>(
+    attr_name: gimli::DwAt,
+    val: gimli::AttributeValue<R>,
+    debug_str: &DebugStr<R>,
+    text_base_addr: u64,
+) -> Result<String, Box<dyn Error>> {
+    // 特定の属性に対して特別な処理を行う
+    let attr_code = attr_name.0 as u64;
+    match attr_code {
+        0x13 => { // DW_AT_language
+            // 言語属性の場合は、値を言語コードとして解釈し、コンパイラ文字列も表示
+            match val {
+                gimli::AttributeValue::Language(lang) => {
+                    let lang_code = lang.0 as u64;
+                    Ok(format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code)))
+                },
+                gimli::AttributeValue::Udata(u) => {
+                    Ok(format!("{} - {}", get_language_name(u), get_language_description(u)))
+                },
+                gimli::AttributeValue::Data1(d) => {
+                    let lang_code = d as u64;
+                    Ok(format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code)))
+                },
+                gimli::AttributeValue::Data2(d) => {
+                    let lang_code = d as u64;
+                    Ok(format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code)))
+                },
+                gimli::AttributeValue::Data4(d) => {
+                    let lang_code = d as u64;
+                    Ok(format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code)))
+                },
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        },
+        0x11 | 0x12 => { // DW_AT_high_pc (0x13) | DW_AT_low_pc (0x12)
+            // アドレス属性の場合は、値をアドレスとして解釈
+            match val {
+                gimli::AttributeValue::Addr(addr) => {
+                    let final_addr = if addr < 0x100000000 && text_base_addr > 0 {
+                        addr + text_base_addr
+                    } else {
+                        addr
+                    };
+                    Ok(format!("0x{:x}", final_addr))
+                },
+                gimli::AttributeValue::Udata(u) => {
+                    // DW_AT_high_pcの値が言語コードの範囲内にある場合の特別処理
+                    if attr_code == 0x13 && u >= 0x01 && u <= 0x2f {
+                        // 言語コードの範囲内の場合、警告を表示
+                        Ok(format!("0x{:x} (警告: この値は言語コード {} のようです)", u, get_language_name(u)))
+                    } else {
+                        let final_addr = if attr_code == 0x12 && text_base_addr > 0 {
+                            u + text_base_addr
+                        } else if attr_code == 0x13 && text_base_addr > 0 {
+                            // DW_AT_high_pcの場合、値が小さければオフセット、大きければ絶対アドレス
+                            if u < 0x100000000 { u + text_base_addr } else { u }
+                        } else {
+                            u
+                        };
+                        Ok(format!("0x{:x}", final_addr))
+                    }
+                },
+                gimli::AttributeValue::Data1(d) => {
+                    let final_addr = if (attr_code == 0x12 || attr_code == 0x13) && text_base_addr > 0 {
+                        d as u64 + text_base_addr
+                    } else {
+                        d as u64
+                    };
+                    Ok(format!("0x{:x}", final_addr))
+                },
+                gimli::AttributeValue::Data2(d) => {
+                    let final_addr = if (attr_code == 0x12 || attr_code == 0x13) && text_base_addr > 0 {
+                        d as u64 + text_base_addr
+                    } else {
+                        d as u64
+                    };
+                    Ok(format!("0x{:x}", final_addr))
+                },
+                gimli::AttributeValue::Data4(d) => {
+                    let final_addr = if (attr_code == 0x12 || attr_code == 0x13) && text_base_addr > 0 {
+                        d as u64 + text_base_addr
+                    } else {
+                        d as u64
+                    };
+                    Ok(format!("0x{:x}", final_addr))
+                },
+                gimli::AttributeValue::Data8(d) => {
+                    let final_addr = if (attr_code == 0x12 || attr_code == 0x13) && text_base_addr > 0 {
+                        d + text_base_addr
+                    } else {
+                        d
+                    };
+                    Ok(format!("0x{:x}", final_addr))
+                },
+                gimli::AttributeValue::DebugAddrIndex(addr_index) => {
+                    // DWARF 5のアドレスインデックス形式
+                    Ok(format!("addr_index[{:?}] (requires .debug_addr section)", addr_index.0))
+                },
+                gimli::AttributeValue::Language(lang) => {
+                    // 誤って言語として解釈された場合、生の値を取得
+                    Ok(format!("0x{:x}", lang.0 as u64))
+                },
+                _ => dwarf_attr_to_string(val, debug_str)
+            }
+        },
+        // DWARF 5の新しい属性
+        0x69 => { // DW_AT_str_offsets_base
+            match val {
+                gimli::AttributeValue::SecOffset(_) => Ok(format!("str_offsets_base: <sec_offset>")),
+                gimli::AttributeValue::Udata(u) => Ok(format!("str_offsets_base: 0x{:x}", u)),
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        },
+        0x6a => { // DW_AT_addr_base
+            match val {
+                gimli::AttributeValue::SecOffset(_) => Ok(format!("addr_base: <sec_offset>")),
+                gimli::AttributeValue::Udata(u) => Ok(format!("addr_base: 0x{:x}", u)),
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        },
+        0x6b => { // DW_AT_rnglists_base
+            match val {
+                gimli::AttributeValue::SecOffset(_) => Ok(format!("rnglists_base: <sec_offset>")),
+                gimli::AttributeValue::Udata(u) => Ok(format!("rnglists_base: 0x{:x}", u)),
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        },
+        0x82 => { // DW_AT_loclists_base
+            match val {
+                gimli::AttributeValue::SecOffset(_) => Ok(format!("loclists_base: <sec_offset>")),
+                gimli::AttributeValue::Udata(u) => Ok(format!("loclists_base: 0x{:x}", u)),
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        },
+        // DWARF 5の新しいフォーム処理
+        _ => {
+            match val {
+                // DWARF 5の新しいフォーム
+                gimli::AttributeValue::DebugStrOffsetsIndex(index) => {
+                    Ok(format!("str_offsets_index[{:?}] (requires .debug_str_offsets)", index.0))
+                },
+                gimli::AttributeValue::DebugAddrIndex(index) => {
+                    Ok(format!("addr_index[{:?}] (requires .debug_addr)", index.0))
+                },
+                gimli::AttributeValue::DebugLocListsIndex(index) => {
+                    Ok(format!("loclists_index[{:?}] (requires .debug_loclists)", index.0))
+                },
+                gimli::AttributeValue::DebugRngListsIndex(index) => {
+                    Ok(format!("rnglists_index[{:?}] (requires .debug_rnglists)", index.0))
+                },
+                _ => dwarf_attr_to_string(val, debug_str),
+            }
+        }
+    }
+}
+
+fn display_debug_line_details_manual(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
+    println!("\n=== __debug_line 詳細解析 ===");
+    
+    let debug_line_section = match find_section_by_name(sections, "__debug_line") {
+        Some(section) => section,
+        None => {
+            println!("__debug_lineセクションが見つかりません");
+            return;
+        }
+    };
+    
+    let start_offset = debug_line_section.offset as usize;
+    let section_size = debug_line_section.size as usize;
+    
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __debug_lineセクションのデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    println!("セクションサイズ: {} バイト", section_data.len());
+    
+    let mut offset = 0;
+    let mut unit_count = 0;
+    
+    while offset + 12 < section_data.len() && unit_count < 5 {
+        unit_count += 1;
+        println!("\n--- ライン番号プログラム {} ---", unit_count);
+        
+        // ヘッダーを解析
+        let unit_length = u32::from_le_bytes([
+            section_data[offset], section_data[offset + 1],
+            section_data[offset + 2], section_data[offset + 3]
+        ]);
+        offset += 4;
+        
+        if unit_length == 0 || unit_length as usize > section_data.len() - offset {
+            println!("  無効なユニット長: {}", unit_length);
+            break;
+        }
+        
+        let version = u16::from_le_bytes([
+            section_data[offset], section_data[offset + 1]
+        ]);
+        offset += 2;
+        
+        // DWARF 5では新しいヘッダーフォーマット
+        let (header_length, address_size, segment_selector_size) = if version >= 5 {
+            let address_size = section_data[offset];
+            offset += 1;
+            let segment_selector_size = section_data[offset];
+            offset += 1;
+            let header_length = u32::from_le_bytes([
+                section_data[offset], section_data[offset + 1],
+                section_data[offset + 2], section_data[offset + 3]
+            ]);
+            offset += 4;
+            (header_length, address_size, segment_selector_size)
+        } else {
+            let header_length = u32::from_le_bytes([
+                section_data[offset], section_data[offset + 1],
+                section_data[offset + 2], section_data[offset + 3]
+            ]);
+            offset += 4;
+            (header_length, 8u8, 0u8) // デフォルト値
+        };
+        
+        let min_instruction_length = section_data[offset];
+        offset += 1;
+        
+        // DWARF 4以降では maximum_operations_per_instruction フィールドが追加
+        let max_ops_per_instruction = if version >= 4 {
+            let val = section_data[offset];
+            offset += 1;
+            val
+        } else {
+            1
+        };
+        
+        let default_is_stmt = section_data[offset] != 0;
+        offset += 1;
+        
+        let line_base = section_data[offset] as i8;
+        offset += 1;
+        
+        let line_range = section_data[offset];
+        offset += 1;
+        
+        let opcode_base = section_data[offset];
+        offset += 1;
+        
+        println!("  ユニット長: {} バイト", unit_length);
+        println!("  バージョン: {} (DWARF {})", version, version);
+        if version >= 5 {
+            println!("  アドレスサイズ: {} バイト", address_size);
+            println!("  セグメントセレクタサイズ: {} バイト", segment_selector_size);
+        }
+        println!("  ヘッダー長: {} バイト", header_length);
+        println!("  最小命令長: {}", min_instruction_length);
+        if version >= 4 {
+            println!("  命令あたり最大操作数: {}", max_ops_per_instruction);
+        }
+        println!("  デフォルトis_stmt: {}", default_is_stmt);
+        println!("  行ベース: {}", line_base);
+        println!("  行範囲: {}", line_range);
+        println!("  オペコードベース: {}", opcode_base);
+        
+        // 標準オペコード長テーブルをスキップ
+        for _ in 1..opcode_base {
+            if offset >= section_data.len() {
+                break;
+            }
+            offset += 1;
+        }
+        
+        // ディレクトリテーブルを解析
+        println!("\n  ディレクトリテーブル:");
+        let mut dir_count = 0;
+        while offset < section_data.len() && section_data[offset] != 0 && dir_count < 10 {
+            let (dir_name, consumed) = extract_null_terminated_string(&section_data[offset..]);
+            println!("    {}: {}", dir_count, dir_name);
+            offset += consumed;
+            dir_count += 1;
+        }
+        if offset < section_data.len() && section_data[offset] == 0 {
+            offset += 1; // ディレクトリテーブル終端のnull
+        }
+        
+        // ファイル名テーブルを解析（バージョン別）
+        println!("\n  ファイル名テーブル:");
+        let (directories, file_names) = if version >= 5 {
+            parse_dwarf5_file_table(section_data, &mut offset)
+        } else {
+            parse_dwarf2_4_file_table(section_data, &mut offset)
+        };
+        
+        for (i, file_name) in file_names.iter().enumerate() {
+            println!("    {}: {}", i + 1, file_name);
+            if i >= 19 {
+                println!("    ... (残りのファイルは省略)");
+                break;
+            }
+        }
+        
+        // ライン番号プログラムを解析
+        let program_start = offset;
+        let program_end = std::cmp::min(start_offset + 4 + unit_length as usize, section_data.len());
+        
+        if program_start < program_end {
+            let program_data = &section_data[program_start..program_end];
+            println!("\n  ライン番号プログラム ({} バイト):", program_data.len());
+            parse_line_number_program(program_data, &file_names, line_base, line_range, opcode_base);
+        }
+        
+        // 次のユニットへ
+        offset = start_offset + 4 + unit_length as usize - start_offset;
+        if offset >= section_data.len() {
+            break;
+        }
+    }
+    
+    if unit_count == 0 {
+        println!("ライン番号プログラムが見つかりませんでした");
+    }
+}
+
+fn read_uleb128(buf: &[u8]) -> (u64, usize) {
+    let mut result = 0;
+    let mut shift = 0;
+    let mut i = 0;
+    loop {
+        if i >= buf.len() {
+            return (result, i);
+        }
+        let byte = buf[i];
+        i += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    (result, i)
+}
+
+fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &mach_header_64) {
     println!("\n=== __TEXTセクション逆アセンブル ===");
     println!("仮想アドレス: 0x{:016x}", section.addr);
     println!("サイズ: {} バイト", section.size);
@@ -359,53 +894,51 @@ fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &MachH
     
     // CPUアーキテクチャを判定
     let arch = match header.cputype {
-        16777223 | 117440513 => "x86_64", // Intel x86_64
-        16777228 => "arm64",              // ARM64
-        12 => "arm",                      // ARM 32-bit
+    16777223 | 117440513 => "x86_64", // Intel x86_64 (u32)
+    16777228 | 201326593 => "arm64",  // Apple ARM64 (u32)
+    12 => "arm",                      // ARM 32-bit
+    _ => match header.cputype as i32 {
+        16777223 | 117440513 => "x86_64", // Intel x86_64 (i32)
+        16777228 | 201326593 => "arm64",  // Apple ARM64 (i32)
+        12 => "arm",
         _ => "unknown",
-    };
-    println!("アーキテクチャ: {}", arch);
-    println!("{}", "=".repeat(80));
-    
-    let start_offset = section.offset as usize;
-    let end_offset = start_offset + std::cmp::min(section.size as usize, 400); // 最初の400バイトまで
-    
-    if start_offset >= buffer.len() {
-        println!("エラー: セクションオフセットがファイルサイズを超えています");
-        return;
     }
-    
-    let actual_end = std::cmp::min(end_offset, buffer.len());
-    let mut addr = section.addr;
-    let mut i = start_offset;
-    
-    while i < actual_end {
-        // アーキテクチャに応じて逆アセンブル
-        let (instruction, inst_len) = match arch {
-            "x86_64" => simple_disasm_x86_64(&buffer[i..actual_end], addr),
-            "arm64" => simple_disasm_arm64(&buffer[i..actual_end], addr),
-            "arm" => simple_disasm_arm32(&buffer[i..actual_end], addr),
-            _ => (format!("不明なアーキテクチャ: {}", arch), 4),
-        };
+};
+println!("アーキテクチャ: {} (cputype: {} / 0x{:08x} [{}])", arch, header.cputype, header.cputype, if (header.cputype as i32) < 0 { "i32(負)" } else { "i32(正)" });
+println!("{}", "=".repeat(80));
+
+let start_offset = section.offset as usize;
+let end_offset = start_offset + std::cmp::min(section.size as usize, 400); // 最初の400バイトまで
+
+if start_offset >= buffer.len() {
+    println!("エラー: セクションオフセットがファイルサイズを超えています");
+    return;
+}
+
+let actual_end = std::cmp::min(end_offset, buffer.len());
+let mut addr = section.addr;
+let mut i = start_offset;
+
+while i < actual_end {
+    // x86_64とarm64で明示的に逆アセンブラを分岐
+    let (instruction, inst_len) = if arch == "x86_64" {
+        simple_disasm_x86_64(&buffer[i..actual_end], addr)
+    } else if arch == "arm64" {
+        simple_disasm_arm64(&buffer[i..actual_end], addr)
+    } else if arch == "arm" {
+        simple_disasm_arm32(&buffer[i..actual_end], addr)
+    } else {
+        (format!("不明なアーキテクチャ: {}", arch), 4)
+    };
+
         
-        // アドレスと16進数バイトを表示
-        print!("{:016x}: ", addr);
-        
-        // 命令のバイト数分だけ表示（最大16バイト）
-        let bytes_to_show = std::cmp::min(inst_len, std::cmp::min(16, actual_end - i));
-        
-        // 16進数表示
+        // アドレスと命令バイト・命令名を簡潔に表示（常に64ビット幅）
+        print!("0x{:016x}: ", addr);
+        let bytes_to_show = std::cmp::min(inst_len, std::cmp::min(6, actual_end - i));
         for j in 0..bytes_to_show {
             print!("{:02x} ", buffer[i + j]);
         }
-        
-        // 16バイトに満たない場合はスペースで埋める
-        for _ in bytes_to_show..16 {
-            print!("   ");
-        }
-        
-        print!(" | ");
-        println!("{}", instruction);
+        print!("  {}\n", instruction);
         
         // 命令の長さ分だけ進む
         addr += inst_len as u64;
@@ -429,195 +962,356 @@ fn dump_data_sections(buffer: &[u8], sections: &[SectionInfo]) {
         println!("サイズ: {} バイト", section.size);
         println!("ファイルオフセット: 0x{:08x}", section.offset);
         
-        let start_offset = section.offset as usize;
-        let section_size = section.size as usize;
-        let max_dump_size = 256; // 最大256バイトまでダンプ
-        let dump_size = std::cmp::min(section_size, max_dump_size);
-        
-        if start_offset >= buffer.len() {
-            println!("エラー: セクションオフセットがファイルサイズを超えています");
-            continue;
-        }
-        
-        let actual_end = std::cmp::min(start_offset + dump_size, buffer.len());
-        
-        if actual_end <= start_offset {
-            println!("警告: ダンプするデータがありません");
-            continue;
-        }
-        
+        // 16進ダンプ関連のロジック削除済み
+        // セクション情報のみ表示
         println!("");
-        dump_hex_data(&buffer[start_offset..actual_end], section.addr);
-        
-        if section_size > max_dump_size {
-            println!("... ({} バイト中 {} バイトを表示)", section_size, dump_size);
-        }
+
     }
-    
     println!("{}", "=".repeat(80));
 }
 
-fn dump_hex_data(data: &[u8], base_addr: u64) {
-    let mut addr = base_addr;
-    let mut i = 0;
-    
-    while i < data.len() {
-        // アドレス表示
-        print!("{:016x}: ", addr);
-        
-        // 16バイトまたは残りのバイト数
-        let bytes_to_show = std::cmp::min(16, data.len() - i);
-        
-        // 16進数表示
-        for j in 0..bytes_to_show {
-            print!("{:02x} ", data[i + j]);
-        }
-        
-        // 16バイトに満たない場合はスペースで埋める
-        for _ in bytes_to_show..16 {
-            print!("   ");
-        }
-        
-        print!(" | ");
-        
-        // ASCII表示
-        for j in 0..bytes_to_show {
-            let byte = data[i + j];
-            if byte >= 32 && byte <= 126 {
-                print!("{}", byte as char);
-            } else {
-                print!(".");
+
+fn display_stubs_symbols(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
+    use mach_o_sys::loader::{symtab_command, LC_SYMTAB};
+    use mach_o_sys::nlist::nlist_64;
+    use std::mem;
+
+    println!("\n=== __stubsセクションに属するシンボル一覧 ===");
+
+    // __stubsセクションのセクション番号を取得
+    let stubs_sect_idx = sections.values().enumerate().find_map(|(idx, s)| {
+        if s.name == "__stubs" { Some(idx + 1) } else { None }
+    });
+    if stubs_sect_idx.is_none() {
+        println!("(セクション__stubsが見つかりません)");
+        return;
+    }
+    let stubs_sect_idx = stubs_sect_idx.unwrap() as u8;
+
+    // Mach-Oヘッダ直後からロードコマンドを探索
+    let header_size = mem::size_of::<mach_o_sys::loader::mach_header_64>();
+    let mut offset = header_size;
+    let mut found = false;
+
+    while offset + mem::size_of::<mach_o_sys::loader::load_command>() <= buffer.len() {
+        let lc: &mach_o_sys::loader::load_command = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const mach_o_sys::loader::load_command)
+        };
+        if lc.cmd == LC_SYMTAB as u32 {
+            let symtab: &symtab_command = unsafe {
+                &*(buffer.as_ptr().add(offset) as *const symtab_command)
+            };
+            found = true;
+            let symbol_size = mem::size_of::<nlist_64>();
+            let symtab_start = symtab.symoff as usize;
+            let symtab_end = symtab_start + symtab.nsyms as usize * symbol_size;
+            let strtab_start = symtab.stroff as usize;
+            let strtab_end = strtab_start + symtab.strsize as usize;
+            if symtab_end > buffer.len() || strtab_end > buffer.len() {
+                println!("(シンボルテーブルまたはストリングテーブルが範囲外です)");
+                break;
             }
-        }
-        
-        println!();
-        
-        addr += 16;
-        i += bytes_to_show;
-    }
-}
-
-fn display_debug_info(buffer: &[u8], debug_info: &DebugInfo) {
-    println!("\nDWARFデバッグ情報:");
-    
-    // DWARFセクション情報を表示
-    if !debug_info.dwarf_sections.is_empty() {
-        println!("検出されたDWARFセクション: {}個", debug_info.dwarf_sections.len());
-        
-        for (index, section) in debug_info.dwarf_sections.iter().enumerate() {
-            println!("  [{}] {} (addr=0x{:016x}, size={}, offset=0x{:08x})", 
-                     index + 1, section.name, section.addr, section.size, section.offset);
-        }
-    } else {
-        println!("DWARFデバッグセクションが見つかりませんでした");
-        println!("デバッグ情報を含むdSYMファイルが必要です。");
-    }
-    
-    // シンボルテーブル情報を表示
-    if let Some(symtab) = &debug_info.symtab_info {
-        println!("\nシンボルテーブル情報:");
-        println!("シンボルテーブルオフセット: 0x{:08x}", symtab.symoff);
-        println!("シンボル数: {} 個", symtab.nsyms);
-        println!("文字列テーブルオフセット: 0x{:08x}", symtab.stroff);
-        println!("文字列テーブルサイズ: {} バイト", symtab.strsize);
-        
-        // シンボルの一部を表示
-        display_symbols(buffer, symtab);
-    } else {
-        println!("\nシンボルテーブルが見つかりませんでした");
-    }
-    
-    // DWARFデバッグ情報の詳細解析を実行
-    if !debug_info.dwarf_sections.is_empty() {
-        display_debug_info_detailed(buffer, debug_info);
-    }
-    
-
-}
-
-fn display_symbols(buffer: &[u8], symtab: &SymtabInfo) {
-    println!("\nシンボル一覧:");
-    
-    let symbol_size = 16; // nlist_64のサイズ
-    let max_symbols = symtab.nsyms;
-    
-    for i in 0..max_symbols {
-        let symbol_offset = symtab.symoff as usize + (i as usize * symbol_size);
-        
-        if symbol_offset + symbol_size > buffer.len() {
+            let symtab_slice = &buffer[symtab_start..symtab_end];
+            let strtab = &buffer[strtab_start..strtab_end];
+            for i in 0..(symtab.nsyms as usize) {
+                let symbol_offset = i * symbol_size;
+                let nlist: &mut nlist_64 = unsafe {
+                    &mut *(symtab_slice.as_ptr().add(symbol_offset) as *mut nlist_64)
+                };
+                let n_strx = unsafe { nlist.n_un.n_strx() } as usize;
+                let n_type = nlist.n_type;
+                let n_sect = nlist.n_sect;
+                let n_value = nlist.n_value;
+                if n_sect != stubs_sect_idx {
+                    continue;
+                }
+                let symbol_name = if n_strx == 0 {
+                    "<無名>".to_string()
+                } else if n_strx < strtab.len() {
+                    let name_bytes = &strtab[n_strx..];
+                    match name_bytes.iter().position(|&b| b == 0) {
+                        Some(0) => "<空>".to_string(),
+                        Some(len) => String::from_utf8_lossy(&name_bytes[..len]).to_string(),
+                        None => String::from_utf8_lossy(name_bytes).to_string(),
+                    }
+                } else {
+                    "<無効>".to_string()
+                };
+                let type_str = match n_type & 0x0e {
+                    0x0e => "SECT",
+                    0x00 => "UNDF",
+                    0x02 => "ABS",
+                    0x0c => "PBUD",
+                    0x0a => "INDR",
+                    _ => "OTHER",
+                };
+                let ext = if n_type & 0x01 != 0 { "EXT" } else { "LOC" };
+                println!("{:5} 0x{:016x} {:>5} {:>4} {:>9} {}",
+                    i, n_value, type_str, ext, n_sect, symbol_name);
+            }
+            println!("------------------------------------------------------------");
             break;
         }
-        
-        // nlist_64構造体を読み取り
-        let n_strx = u32::from_le_bytes([
-            buffer[symbol_offset], buffer[symbol_offset + 1],
-            buffer[symbol_offset + 2], buffer[symbol_offset + 3]
-        ]);
-        let n_type = buffer[symbol_offset + 4];
-        let n_sect = buffer[symbol_offset + 5];
-        let _n_desc = u16::from_le_bytes([
-            buffer[symbol_offset + 6], buffer[symbol_offset + 7]
-        ]);
-        let n_value = u64::from_le_bytes([
-            buffer[symbol_offset + 8], buffer[symbol_offset + 9],
-            buffer[symbol_offset + 10], buffer[symbol_offset + 11],
-            buffer[symbol_offset + 12], buffer[symbol_offset + 13],
-            buffer[symbol_offset + 14], buffer[symbol_offset + 15]
-        ]);
-        
-        // シンボル名を取得
-        let symbol_name = if n_strx > 0 {
-            get_string_from_table(buffer, symtab.stroff, symtab.strsize, n_strx)
-        } else {
-            "<無名>".to_string()
-        };
-        
-        // シンボルタイプを判定
-        let symbol_type = match n_type & 0x0e {
-            0x00 => "UNDF", // 未定義
-            0x02 => "ABS",  // 絶対
-            0x0e => "SECT", // セクション
-            0x0c => "PBUD", // プリバインド未定義
-            0x0a => "INDR", // 間接
-            _ => "OTHER",
-        };
-        
-        let external = if n_type & 0x01 != 0 { "EXT" } else { "LOC" };
-        
-        println!("  {}: {} {} sect={} addr=0x{:016x} {}", 
-                 i + 1, symbol_type, external, n_sect, n_value, symbol_name);
+        offset += lc.cmdsize as usize;
     }
-    
-
+    if !found {
+        println!("(シンボルテーブルが見つかりませんでした)");
+    }
 }
 
-fn get_string_from_table(buffer: &[u8], stroff: u32, strsize: u32, str_index: u32) -> String {
-    let start = stroff as usize + str_index as usize;
-    let end = std::cmp::min(start + 256, (stroff + strsize) as usize); // 最大256文字まで
-    
+// __cstringセクションの内容を抽出・表示する関数
+fn display_cstring_section(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __cstring セクション内容 ===");
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __cstringセクションのデータが無効です");
+        return;
+    }
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+
+    // 16進ダンプ表示
+    println!("\n[16進ダンプ]");
+    let max_dump = std::cmp::min(section_data.len(), 512); // 最大512バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("  {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    if section_data.len() > max_dump {
+        println!("  ... (省略。全体: {} バイト)", section_data.len());
+    }
+
+    // 文字列抽出表示
+    println!("\n[ヌル終端文字列一覧]");
+    let mut offset = 0;
+    let mut string_count = 0;
+    let max_strings = 1000;
+    while offset < section_data.len() && string_count < max_strings {
+        let (string_value, consumed) = extract_null_terminated_string(&section_data[offset..]);
+        if !string_value.is_empty() {
+            println!("  {}: [0x{:04x}] {}", string_count, offset, string_value);
+            string_count += 1;
+        }
+        offset += consumed;
+        if consumed == 0 {
+            break;
+        }
+    }
+    if string_count == 0 {
+        println!("  (文字列が見つかりませんでした)");
+    }
+}
+
+/// Mach-Oシンボルテーブルを詳細テーブル形式で表示
+fn display_symbols(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
+    use mach_o_sys::loader::{symtab_command, LC_SYMTAB};
+    use mach_o_sys::nlist::nlist_64;
+    use std::mem;
+
+    println!("------------------------------------------------------------");
+    println!("  idx   アドレス            種別  外部  セクション  シンボル名");
+    println!("------------------------------------------------------------");
+
+    let header_size = mem::size_of::<mach_o_sys::loader::mach_header_64>();
+    let mut offset = header_size;
+    let mut found = false;
+
+    while offset + mem::size_of::<mach_o_sys::loader::load_command>() <= buffer.len() {
+        let lc: &mach_o_sys::loader::load_command = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const mach_o_sys::loader::load_command)
+        };
+        if lc.cmd == LC_SYMTAB as u32 {
+            let symtab: &symtab_command = unsafe {
+                &*(buffer.as_ptr().add(offset) as *const symtab_command)
+            };
+            found = true;
+            let symbol_size = mem::size_of::<nlist_64>();
+            let symtab_start = symtab.symoff as usize;
+            let symtab_end = symtab_start + symtab.nsyms as usize * symbol_size;
+            let strtab_start = symtab.stroff as usize;
+            let strtab_end = strtab_start + symtab.strsize as usize;
+            if symtab_end > buffer.len() || strtab_end > buffer.len() {
+                println!("(シンボルテーブルまたはストリングテーブルが範囲外です)");
+                break;
+            }
+            let symtab_slice = &buffer[symtab_start..symtab_end];
+            let strtab = &buffer[strtab_start..strtab_end];
+            for i in 0..(symtab.nsyms as usize) {
+                let symbol_offset = i * symbol_size;
+                let nlist: &mut nlist_64 = unsafe {
+                    &mut *(symtab_slice.as_ptr().add(symbol_offset) as *mut nlist_64)
+                };
+                let n_strx = unsafe { nlist.n_un.n_strx() } as usize;
+                let n_type = nlist.n_type;
+                let n_sect = nlist.n_sect;
+                let n_value = nlist.n_value;
+                let symbol_name = if n_strx == 0 {
+                    "<無名>".to_string()
+                } else if n_strx < strtab.len() {
+                    let name_bytes = &strtab[n_strx..];
+                    match name_bytes.iter().position(|&b| b == 0) {
+                        Some(0) => "<空>".to_string(),
+                        Some(len) => String::from_utf8_lossy(&name_bytes[..len]).to_string(),
+                        None => String::from_utf8_lossy(name_bytes).to_string(),
+                    }
+                } else {
+                    "<無効>".to_string()
+                };
+                let type_str = match n_type & 0x0e {
+                    0x0e => "SECT",
+                    0x00 => "UNDF",
+                    0x02 => "ABS",
+                    0x0c => "PBUD",
+                    0x0a => "INDR",
+                    _ => "OTHER",
+                };
+                let ext = if n_type & 0x01 != 0 { "EXT" } else { "LOC" };
+                println!("{:5} 0x{:016x} {:>5} {:>4} {:>9} {}",
+                    i, n_value, type_str, ext, n_sect, symbol_name);
+            }
+            println!("------------------------------------------------------------");
+            break;
+        }
+        offset += lc.cmdsize as usize;
+    }
+    if !found {
+        println!("(シンボルテーブルが見つかりませんでした)");
+    }
+
+    println!("\n=== __stubsセクションに属するシンボル一覧 ===");
+
+    // __stubsセクションのセクション番号を取得
+    let stubs_sect_idx = sections.values().enumerate().find_map(|(idx, s)| {
+        if s.name == "__stubs" { Some(idx + 1) } else { None }
+    });
+    if stubs_sect_idx.is_none() {
+        println!("(セクション__stubsが見つかりません)");
+        return;
+    }
+    let stubs_sect_idx = stubs_sect_idx.unwrap() as u8;
+
+    // Mach-Oヘッダ直後からロードコマンドを探索
+    let header_size = mem::size_of::<mach_o_sys::loader::mach_header_64>();
+    let mut offset = header_size;
+    let mut found = false;
+
+    while offset + mem::size_of::<mach_o_sys::loader::load_command>() <= buffer.len() {
+        let lc: &mach_o_sys::loader::load_command = unsafe {
+            &*(buffer.as_ptr().add(offset) as *const mach_o_sys::loader::load_command)
+        };
+        if lc.cmd == LC_SYMTAB as u32 {
+            let symtab: &symtab_command = unsafe {
+                &*(buffer.as_ptr().add(offset) as *const symtab_command)
+            };
+            found = true;
+            let symbol_size = mem::size_of::<nlist_64>();
+            let symtab_start = symtab.symoff as usize;
+            let symtab_end = symtab_start + symtab.nsyms as usize * symbol_size;
+            let strtab_start = symtab.stroff as usize;
+            let strtab_end = strtab_start + symtab.strsize as usize;
+            if symtab_end > buffer.len() || strtab_end > buffer.len() {
+                println!("(シンボルテーブルまたはストリングテーブルが範囲外です)");
+                break;
+            }
+            let symtab_slice = &buffer[symtab_start..symtab_end];
+            let strtab = &buffer[strtab_start..strtab_end];
+            for i in 0..(symtab.nsyms as usize) {
+                let symbol_offset = i * symbol_size;
+                let nlist: &mut nlist_64 = unsafe {
+                    &mut *(symtab_slice.as_ptr().add(symbol_offset) as *mut nlist_64)
+                };
+                let n_strx = unsafe { nlist.n_un.n_strx() } as usize;
+                let n_type = nlist.n_type;
+                let n_sect = nlist.n_sect;
+                let n_value = nlist.n_value;
+                if n_sect != stubs_sect_idx { continue; }
+                let symbol_name = if n_strx == 0 {
+                    "<無名>".to_string()
+                } else if n_strx < strtab.len() {
+                    let name_bytes = &strtab[n_strx..];
+                    match name_bytes.iter().position(|&b| b == 0) {
+                        Some(0) => "<空>".to_string(),
+                        Some(len) => String::from_utf8_lossy(&name_bytes[..len]).to_string(),
+                        None => String::from_utf8_lossy(name_bytes).to_string(),
+                    }
+                } else {
+                    "<無効>".to_string()
+                };
+                let type_str = match n_type & 0x0e {
+                    0x00 => "UNDF",
+                    0x0e => "SECT",
+                    0x02 => "ABS",
+                    0x0c => "PBUD",
+                    0x0a => "INDR",
+                    _ => "OTHER",
+                };
+                let ext = if n_type & 0x01 != 0 { "EXT" } else { "LOC" };
+                println!("{:5} 0x{:016x} {:>5} {:>4} {:>9} {}",
+                    i, n_value, type_str, ext, n_sect, symbol_name);
+            }
+            println!("------------------------------------------------------------");
+            break;
+        }
+        offset += lc.cmdsize as usize;
+    }
+    if !found {
+        println!("(シンボルテーブルが見つかりませんでした)");
+    }
+}
+
+
+
+
+// null終端文字列を抽出するヘルパー関数
+fn get_string_from_table(buffer: &[u8], _stroff: u32, _strsize: u32, str_index: u32) -> String {
+    let start = str_index as usize;
     if start >= buffer.len() {
         return "<無効>".to_string();
     }
-    
+    let end = std::cmp::min(start + 256, buffer.len()); // 最大256文字まで
     // ヌル終端文字列を探す
     let mut actual_end = start;
-    for i in start..std::cmp::min(end, buffer.len()) {
+    for i in start..end {
         if buffer[i] == 0 {
             actual_end = i;
             break;
         }
         actual_end = i + 1;
     }
-    
     if actual_end <= start {
         return "<空>".to_string();
     }
-    
-    // UTF-8として解釈
     match std::str::from_utf8(&buffer[start..actual_end]) {
         Ok(s) => s.to_string(),
         Err(_) => format!("<バイナリ:{:02x}...>", buffer[start]),
     }
+}
+
+// null終端文字列を抽出するヘルパー関数
+fn extract_null_terminated_string(data: &[u8]) -> (String, usize) {
+    let mut string = String::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let byte = data[offset];
+        if byte == 0 {
+            break;
+        }
+        string.push(byte as char);
+        offset += 1;
+    }
+    (string, offset + 1)
 }
 
 // ModRMバイトの解析ヘルパー関数
@@ -627,23 +1321,16 @@ fn parse_modrm_length(modrm: u8, code: &[u8], offset: usize) -> usize {
     
     match mod_bits {
         0b00 => {
-            if rm == 0b100 {
-                // SIBバイトが必要
-                if offset + 1 < code.len() {
-                    let sib = code[offset + 1];
-                    let base = sib & 0x07;
-                    if base == 0b101 {
-                        6 // ModRM + SIB + disp32
-                    } else {
-                        2 // ModRM + SIB
-                    }
+            if offset + 1 < code.len() {
+                let sib = code[offset + 1];
+                let base = sib & 0x07;
+                if base == 0b101 {
+                    6 // ModRM + SIB + disp32
                 } else {
-                    2
+                    2 // ModRM + SIB
                 }
-            } else if rm == 0b101 {
-                5 // ModRM + disp32
             } else {
-                1 // ModRMのみ
+                2
             }
         },
         0b01 => {
@@ -807,7 +1494,9 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
                 let modrm_len = parse_modrm_length(code[offset + 1], code, offset + 1);
                 length += modrm_len;
                 if length + 4 <= code.len() {
-                    let imm = u32::from_le_bytes([code[length], code[length+1], code[length+2], code[length+3]]);
+                    let imm = u32::from_le_bytes([
+                        code[length], code[length+1], code[length+2], code[length+3],
+                    ]);
                     length += 4;
                     (format!("mov {}, 0x{:08x}", if rex_prefix { "r64" } else { "r32" }, imm), length)
                 } else {
@@ -869,8 +1558,10 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
                         if length < code.len() {
                             let modrm_len = parse_modrm_length(code[length], code, length);
                             length += modrm_len;
+                            ("nop (multi-byte)".to_string(), length)
+                        } else {
+                            ("0f 1f (incomplete)".to_string(), length)
                         }
-                        ("nop (multi-byte)".to_string(), length)
                     },
                     0x84 => {
                         length += 1;
@@ -902,10 +1593,7 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
             } else {
                 ("0f (incomplete)".to_string(), length)
             }
-        },
-        
-        // Misc instructions
-        0x90 => ("nop".to_string(), length),
+        },        0x90 => ("nop".to_string(), length),
         0xcc => ("int3".to_string(), length),
         0xb0..=0xbf => {
             // MOV reg, imm8/imm32/imm64
@@ -914,7 +1602,7 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
                 if length + 8 <= code.len() {
                     let imm = u64::from_le_bytes([
                         code[length], code[length+1], code[length+2], code[length+3],
-                        code[length+4], code[length+5], code[length+6], code[length+7]
+                        code[length+4], code[length+5], code[length+6], code[length+7],
                     ]);
                     length += 8;
                     (format!("mov r{}, 0x{:016x}", opcode & 0x07, imm), length)
@@ -924,7 +1612,9 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
             } else if (opcode & 0x08) != 0 {
                 // 32-bit immediate
                 if length + 4 <= code.len() {
-                    let imm = u32::from_le_bytes([code[length], code[length+1], code[length+2], code[length+3]]);
+                    let imm = u32::from_le_bytes([
+                        code[length], code[length+1], code[length+2], code[length+3],
+                    ]);
                     length += 4;
                     (format!("mov r{}, 0x{:08x}", opcode & 0x07, imm), length)
                 } else {
@@ -941,7 +1631,6 @@ fn simple_disasm_x86_64(code: &[u8], addr: u64) -> (String, usize) {
                 }
             }
         },
-        
         _ => (format!("db 0x{:02x}", opcode), length),
     }
 }
@@ -957,6 +1646,58 @@ fn simple_disasm_arm64(code: &[u8], addr: u64) -> (String, usize) {
     
     // 基本的なARM64命令パターンを解析
     let instruction = match inst {
+        // AND (register) - 0x8a000000 | rm << 16 | rn << 5 | rd
+        i if (i & 0xff2003e0) == 0x8a000000 => {
+            let rm = (i >> 16) & 0x1f;
+            let rn = (i >> 5) & 0x1f;
+            let rd = i & 0x1f;
+            format!("and x{}, x{}, x{}", rd, rn, rm)
+        },
+        // ORR (register) - 0xaa000000 | rm << 16 | rn << 5 | rd
+        i if (i & 0xff2003e0) == 0xaa000000 => {
+            let rm = (i >> 16) & 0x1f;
+            let rn = (i >> 5) & 0x1f;
+            let rd = i & 0x1f;
+            format!("orr x{}, x{}, x{}", rd, rn, rm)
+        },
+        // EOR (register) - 0xca000000 | rm << 16 | rn << 5 | rd
+        i if (i & 0xff2003e0) == 0xca000000 => {
+            let rm = (i >> 16) & 0x1f;
+            let rn = (i >> 5) & 0x1f;
+            let rd = i & 0x1f;
+            format!("eor x{}, x{}, x{}", rd, rn, rm)
+        },
+        // CMP (immediate) - SUBS xzr, xn, #imm12
+        i if (i & 0xffc003ff) == 0xf10003ff => {
+            let imm12 = (i >> 10) & 0xfff;
+            let rn = (i >> 5) & 0x1f;
+            format!("cmp x{}, #{}", rn, imm12)
+        },
+        // ADRP - 0x90000000 | immlo << 29 | immhi << 5 | rd
+        i if (i & 0x9f000000) == 0x90000000 => {
+            let immlo = (i >> 29) & 0x3;
+            let immhi = (i >> 5) & 0x7ffff;
+            let rd = i & 0x1f;
+            let imm = ((immhi << 14) | (immlo << 12)) as i64;
+            let page = ((addr as i64) & !0xfff) + imm;
+            format!("adrp x{}, 0x{:x}", rd, page)
+        },
+        // CBZ - 0xb4000000 | imm19 << 5 | rt
+        i if (i & 0x7f000000) == 0x34000000 => {
+            let imm19 = (i >> 5) & 0x7ffff;
+            let rt = i & 0x1f;
+            let offset = ((imm19 << 2) as i32) | if (imm19 & 0x40000) != 0 { !0x7ffff + 1 } else { 0 };
+            let target = (addr as i64 + offset as i64) as u64;
+            format!("cbz x{}, 0x{:x}", rt, target)
+        },
+        // CBNZ - 0x35000000
+        i if (i & 0x7f000000) == 0x35000000 => {
+            let imm19 = (i >> 5) & 0x7ffff;
+            let rt = i & 0x1f;
+            let offset = ((imm19 << 2) as i32) | if (imm19 & 0x40000) != 0 { !0x7ffff + 1 } else { 0 };
+            let target = (addr as i64 + offset as i64) as u64;
+            format!("cbnz x{}, 0x{:x}", rt, target)
+        },
         // NOP (0xd503201f)
         0xd503201f => "nop".to_string(),
         
@@ -1091,12 +1832,9 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
     let instruction = match inst & 0x0fffffff {
         // NOP (mov r0, r0)
         i if i == 0x01a00000 => format!("nop{}", cond_str),
-        
         // BX lr (0x012fff1e)
         0x012fff1e => format!("bx{} lr", cond_str),
-        
         _ => {
-            // より詳細な命令解析
             match (inst >> 25) & 0x7 {
                 // データ処理命令 (bits 27-25 = 000)
                 0x0 => {
@@ -1104,7 +1842,6 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
                     let s = (inst >> 20) & 1;
                     let rn = (inst >> 16) & 0xf;
                     let rd = (inst >> 12) & 0xf;
-                    
                     let op_str = match opcode {
                         0x0 => "and", 0x1 => "eor", 0x2 => "sub", 0x3 => "rsb",
                         0x4 => "add", 0x5 => "adc", 0x6 => "sbc", 0x7 => "rsc",
@@ -1112,9 +1849,7 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
                         0xc => "orr", 0xd => "mov", 0xe => "bic", 0xf => "mvn",
                         _ => "unknown",
                     };
-                    
                     let s_str = if s == 1 { "s" } else { "" };
-                    
                     if (inst >> 25) & 1 == 1 {
                         // 即値オペランド
                         let imm = inst & 0xff;
@@ -1127,7 +1862,6 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
                         format!("{}{}{} r{}, r{}, r{}", op_str, cond_str, s_str, rd, rn, rm)
                     }
                 },
-                
                 // 分岐命令 (bits 27-25 = 101)
                 0x5 => {
                     let l = (inst >> 24) & 1;
@@ -1138,36 +1872,31 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
                         offset
                     };
                     let target = (addr as i64 + (sign_extended * 4) as i64 + 8) as u64;
-                    
                     if l == 1 {
                         format!("bl{} 0x{:x}", cond_str, target)
                     } else {
                         format!("b{} 0x{:x}", cond_str, target)
                     }
                 },
-                
                 // ロード/ストア命令 (bits 27-26 = 01)
                 0x2 | 0x3 => {
                     let l = (inst >> 20) & 1;
                     let rn = (inst >> 16) & 0xf;
                     let rd = (inst >> 12) & 0xf;
-                    
                     if l == 1 {
                         format!("ldr{} r{}, [r{}]", cond_str, rd, rn)
                     } else {
                         format!("str{} r{}, [r{}]", cond_str, rd, rn)
                     }
                 },
-                
                 _ => format!(".word 0x{:08x}", inst),
             }
         },
     };
-    
     (instruction, 4)
 }
 
-fn display_macho_header(header: &MachHeader64) {
+fn display_macho_header(header: &mach_header_64) {
     println!("\n=== Mach-Oヘッダー情報 ===");
     
     // マジックナンバー
@@ -1194,7 +1923,8 @@ fn display_macho_header(header: &MachHeader64) {
         16777223 => "Intel x86_64", // 0x01000007
         16777228 => "ARM64",        // 0x0100000c
         117440513 => "Intel x86_64 (バイトオーダー問題)", // 0x07000001 (実際の読み取り値)
-        50331648 => "x86_64 サブタイプ (バイトオーダー問題)", // 0x03000000
+        50331648 => "x86_64 サブタイプ (バイトオーダー問題)",
+        201326593 => "ARM64", // 0x03000000
         _ => "不明",
     };
     println!("CPUタイプ: {} ({})", cpu_str, header.cputype);
@@ -1264,193 +1994,76 @@ fn display_macho_header(header: &MachHeader64) {
     if header.flags & 0x4000000 != 0 { println!("  - NLIST_OUTOFSYNC_WITH_DYLDINFO: nlistがdyldinfoと非同期"); }
     if header.flags & 0x8000000 != 0 { println!("  - SIM_SUPPORT: シミュレーターサポート"); }
     
-    println!("予約済み: 0x{:08x}", header.reserved);
-    println!("{}", "=".repeat(80));
 }
 
-// dSYMファイルのパスを構築する関数
-fn find_dsym_file(executable_path: &str) -> Option<String> {
-    let path = Path::new(executable_path);
-    let file_name = path.file_name()?.to_str()?;
-    let parent_dir = path.parent().unwrap_or(Path::new("."));
-    
-    // dSYMファイルのパスを構築
-    let dsym_path = parent_dir.join(format!("{}.dSYM", file_name))
-        .join("Contents")
-        .join("Resources")
-        .join("DWARF")
-        .join(file_name);
-    
-    // dSYMファイルが存在するかチェック
-    if dsym_path.exists() {
-        Some(dsym_path.to_string_lossy().to_string())
-    } else {
-        None
+fn load_command_to_string(load_command: u32) -> String {
+    match load_command {
+        0x1 => "LC_SEGMENT".to_string(),
+        0x2 => "LC_SYMTAB".to_string(),
+        0x3 => "LC_SYMSEG".to_string(),
+        0x4 => "LC_THREAD".to_string(),
+        0x5 => "LC_UNIXTHREAD".to_string(),
+        0x6 => "LC_LOADFVMLIB".to_string(),
+        0x7 => "LC_IDFVMLIB".to_string(),
+        0x8 => "LC_IDENT".to_string(),
+        0x9 => "LC_FVMFILE".to_string(),
+        0xa => "LC_PREPAGE".to_string(),
+        0xb => "LC_DYSYMTAB".to_string(),
+        0xc => "LC_LOAD_DYLIB".to_string(),
+        0xd => "LC_ID_DYLIB".to_string(),
+        0xe => "LC_LOAD_DYLINKER".to_string(),
+        0xf => "LC_ID_DYLINKER".to_string(),
+        0x10 => "LC_PREBOUND_DYLIB".to_string(),
+        0x11 => "LC_ROUTINES".to_string(),
+        0x12 => "LC_SUB_FRAMEWORK".to_string(),
+        0x13 => "LC_SUB_UMBRELLA".to_string(),
+        0x14 => "LC_SUB_CLIENT".to_string(),
+        0x15 => "LC_TWOLEVEL_HINTS".to_string(),
+        0x16 => "LC_PREBIND_CKSUM".to_string(),
+        0x17 => "LC_LOAD_WEAK_DYLIB".to_string(),
+        0x18 => "LC_SEGMENT_64".to_string(),
+        0x19 => "LC_ROUTINES_64".to_string(),
+        0x1a => "LC_UUID".to_string(),
+        0x1b => "LC_RPATH".to_string(),
+        0x1c => "LC_CODE_SIGNATURE".to_string(),
+        0x1d => "LC_SEGMENT_SPLIT_INFO".to_string(),
+        0x1e => "LC_REEXPORT_DYLIB".to_string(),
+        0x1f => "LC_LAZY_LOAD_DYLIB".to_string(),
+        0x20 => "LC_ENCRYPTION_INFO".to_string(),
+        0x21 => "LC_DYLD_INFO".to_string(),
+        0x22 => "LC_DYLD_INFO_ONLY".to_string(),
+        0x23 => "LC_LOAD_UPWARD_DYLIB".to_string(),
+        0x24 => "LC_VERSION_MIN_MACOSX".to_string(),
+        0x25 => "LC_VERSION_MIN_IPHONEOS".to_string(),
+        0x26 => "LC_FUNCTION_STARTS".to_string(),
+        0x27 => "LC_DYLD_ENVIRONMENT".to_string(),
+        0x28 => "LC_MAIN".to_string(),
+        0x29 => "LC_DATA_IN_CODE".to_string(),
+        0x2a => "LC_SOURCE_VERSION".to_string(),
+        0x2b => "LC_DYLIB_CODE_SIGN_DRS".to_string(),
+        0x2c => "LC_ENCRYPTION_INFO_64".to_string(),
+        0x2d => "LC_LINKER_OPTION".to_string(),
+        0x2e => "LC_LINKER_OPTIMIZATION_HINT".to_string(),
+        0x2f => "LC_VERSION_MIN_TVOS".to_string(),
+        0x30 => "LC_VERSION_MIN_WATCHOS".to_string(),
+        0x31 => "LC_NOTE".to_string(),
+        0x32 => "LC_BUILD_VERSION".to_string(),
+        0x33 => "LC_DYLD_EXPORTS_TRIE".to_string(),
+        0x34 => "LC_DYLD_CHAINED_FIXUPS".to_string(),
+        _ => "不明".to_string(),
     }
 }
 
-fn dump_file(file_path: &str) -> io::Result<()> {
-    let mut file = File::open(file_path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    
-    println!("ファイル: {}", file_path);
-    println!("サイズ: {} バイト", buffer.len());
-    
-    // Mach-Oファイルかどうかチェックしてヘッダー情報を表示
-    if is_macho_file(&buffer) {
-        if let Some(macho_header) = parse_macho_header(&buffer) {
-            display_macho_header(&macho_header);
-            
-            // __TEXTセクションを探して逆アセンブル
-            if let Some(text_section) = find_text_section(&buffer, &macho_header) {
-                disassemble_text_section(&buffer, &text_section, &macho_header);
-            } else {
-                println!("警告: __TEXTセクションが見つかりませんでした");
-            }
-            
-            // __DATAセクションを探してダンプ
-            let data_sections = find_data_sections(&buffer, &macho_header);
-            dump_data_sections(&buffer, &data_sections);
-            
-            // デバッグ情報を探して表示
-            let debug_info = find_debug_info(&buffer, &macho_header);
-            
-            // dSYMファイルからDWARFデバッグ情報を追加で読み込み
-            if debug_info.dwarf_sections.is_empty() {
-                if let Some(dsym_path) = find_dsym_file(file_path) {
-                    println!("\n対応するdSYMファイルを発見: {}", dsym_path);
-                    
-                    // dSYMファイルを読み込み
-                    if let Ok(mut dsym_file) = File::open(&dsym_path) {
-                        let mut dsym_buffer = Vec::new();
-                        if dsym_file.read_to_end(&mut dsym_buffer).is_ok() {
-                            if let Some(dsym_header) = parse_macho_header(&dsym_buffer) {
-                                let dsym_debug_info = find_debug_info(&dsym_buffer, &dsym_header);
-                                if !dsym_debug_info.dwarf_sections.is_empty() {
-                                    println!("dSYMファイルからDWARFデバッグ情報を読み込みました");
-                                    display_debug_info(&dsym_buffer, &dsym_debug_info);
-                                } else {
-                                    display_debug_info(&buffer, &debug_info);
-                                }
-                            } else {
-                                println!("警告: dSYMファイルの解析に失敗しました");
-                                display_debug_info(&buffer, &debug_info);
-                            }
-                        } else {
-                            println!("警告: dSYMファイルの読み込みに失敗しました");
-                            display_debug_info(&buffer, &debug_info);
-                        }
-                    } else {
-                        println!("警告: dSYMファイルを開けませんでした");
-                        display_debug_info(&buffer, &debug_info);
-                    }
-                } else {
-                    display_debug_info(&buffer, &debug_info);
-                }
-            } else {
-                display_debug_info(&buffer, &debug_info);
-            }
-        } else {
-            println!("警告: Mach-Oファイルですが、ヘッダーの解析に失敗しました");
-            println!("{}", "=".repeat(80));
-        }
-    } else {
-        println!("{}", "=".repeat(80));
-        println!("ファイルタイプ: 不明なバイナリファイル");
-        println!("{}", "=".repeat(80));
-    }
-    
-    Ok(())
-}
-
-// DWARFバージョンに応じたDIEタグ名を取得
 fn get_die_tag_name(abbrev_code: u64, version: u16) -> &'static str {
     match version {
-        1 => {
-            // DWARF1: 基本的なタグのみ
+        1 => { // DWARF1
             match abbrev_code {
-                0x11 => "DW_TAG_compile_unit",
-                0x24 => "DW_TAG_base_type",
-                0x2e => "DW_TAG_subprogram",
-                0x34 => "DW_TAG_variable",
-                0x05 => "DW_TAG_formal_parameter",
-                0x0d => "DW_TAG_member",
-                0x13 => "DW_TAG_structure_type",
-                0x17 => "DW_TAG_union_type",
-                0x01 => "DW_TAG_array_type",
-                0x0f => "DW_TAG_pointer_type",
-                _ => "DW_TAG_unknown",
-            }
-        },
-        2 => {
-            // DWARF2: 標準化された最初のバージョン
-            match abbrev_code {
-                0x01 => "DW_TAG_array_type",
-                0x04 => "DW_TAG_enumeration_type",
-                0x05 => "DW_TAG_formal_parameter",
-                0x0b => "DW_TAG_lexical_block",
-                0x0d => "DW_TAG_member",
-                0x0f => "DW_TAG_pointer_type",
-                0x11 => "DW_TAG_compile_unit",
-                0x13 => "DW_TAG_structure_type",
-                0x15 => "DW_TAG_subroutine_type",
-                0x16 => "DW_TAG_typedef",
-                0x17 => "DW_TAG_union_type",
-                0x21 => "DW_TAG_subrange_type",
-                0x24 => "DW_TAG_base_type",
-                0x26 => "DW_TAG_const_type",
-                0x28 => "DW_TAG_enumerator",
-                0x2e => "DW_TAG_subprogram",
-                0x34 => "DW_TAG_variable",
-                0x35 => "DW_TAG_volatile_type",
-                _ => "DW_TAG_unknown",
-            }
-        },
-        3 => {
-            // DWARF3: DWARF2の拡張
-            match abbrev_code {
-                0x01 => "DW_TAG_array_type",
-                0x02 => "DW_TAG_class_type",
-                0x04 => "DW_TAG_enumeration_type",
-                0x05 => "DW_TAG_formal_parameter",
-                0x08 => "DW_TAG_imported_declaration",
-                0x0b => "DW_TAG_lexical_block",
-                0x0d => "DW_TAG_member",
-                0x0f => "DW_TAG_pointer_type",
-                0x10 => "DW_TAG_reference_type",
-                0x11 => "DW_TAG_compile_unit",
-                0x13 => "DW_TAG_structure_type",
-                0x15 => "DW_TAG_subroutine_type",
-                0x16 => "DW_TAG_typedef",
-                0x17 => "DW_TAG_union_type",
-                0x1c => "DW_TAG_inheritance",
-                0x1d => "DW_TAG_inlined_subroutine",
-                0x1e => "DW_TAG_module",
-                0x21 => "DW_TAG_subrange_type",
-                0x24 => "DW_TAG_base_type",
-                0x26 => "DW_TAG_const_type",
-                0x28 => "DW_TAG_enumerator",
-                0x2e => "DW_TAG_subprogram",
-                0x2f => "DW_TAG_template_type_parameter",
-                0x30 => "DW_TAG_template_value_parameter",
-                0x34 => "DW_TAG_variable",
-                0x35 => "DW_TAG_volatile_type",
-                0x37 => "DW_TAG_restrict_type",
-                0x39 => "DW_TAG_namespace",
-                0x3a => "DW_TAG_imported_module",
-                0x3b => "DW_TAG_unspecified_type",
-                _ => "DW_TAG_unknown",
-            }
-        },
-        4 => {
-            // DWARF4: 型シグネチャや分割DWARFのサポート
-            match abbrev_code {
-                0x01 => "DW_TAG_array_type",
-                0x02 => "DW_TAG_class_type",
-                0x03 => "DW_TAG_entry_point",
-                0x04 => "DW_TAG_enumeration_type",
-                0x05 => "DW_TAG_formal_parameter",
+                0x01 => "DW_TAG_padding",
+                0x02 => "DW_TAG_array_type",
+                0x03 => "DW_TAG_class_type",
+                0x04 => "DW_TAG_entry_point",
+                0x05 => "DW_TAG_enumeration_type",
+                0x06 => "DW_TAG_formal_parameter",
                 0x08 => "DW_TAG_imported_declaration",
                 0x0a => "DW_TAG_label",
                 0x0b => "DW_TAG_lexical_block",
@@ -1458,41 +2071,45 @@ fn get_die_tag_name(abbrev_code: u64, version: u16) -> &'static str {
                 0x0f => "DW_TAG_pointer_type",
                 0x10 => "DW_TAG_reference_type",
                 0x11 => "DW_TAG_compile_unit",
+                0x12 => "DW_TAG_string_type",
                 0x13 => "DW_TAG_structure_type",
                 0x15 => "DW_TAG_subroutine_type",
                 0x16 => "DW_TAG_typedef",
                 0x17 => "DW_TAG_union_type",
                 0x18 => "DW_TAG_unspecified_parameters",
+                0x19 => "DW_TAG_variant",
+                0x1a => "DW_TAG_common_block",
+                0x1b => "DW_TAG_common_inclusion",
                 0x1c => "DW_TAG_inheritance",
                 0x1d => "DW_TAG_inlined_subroutine",
                 0x1e => "DW_TAG_module",
                 0x1f => "DW_TAG_ptr_to_member_type",
+                0x20 => "DW_TAG_set_type",
                 0x21 => "DW_TAG_subrange_type",
+                0x22 => "DW_TAG_with_stmt",
+                0x23 => "DW_TAG_access_declaration",
                 0x24 => "DW_TAG_base_type",
+                0x25 => "DW_TAG_catch_block",
                 0x26 => "DW_TAG_const_type",
                 0x27 => "DW_TAG_constant",
                 0x28 => "DW_TAG_enumerator",
+                0x29 => "DW_TAG_file_type",
+                0x2a => "DW_TAG_friend",
+                0x2b => "DW_TAG_namelist",
+                0x2c => "DW_TAG_namelist_item",
+                0x2d => "DW_TAG_packed_type",
                 0x2e => "DW_TAG_subprogram",
                 0x2f => "DW_TAG_template_type_parameter",
                 0x30 => "DW_TAG_template_value_parameter",
+                0x31 => "DW_TAG_thrown_type",
+                0x32 => "DW_TAG_try_block",
+                0x33 => "DW_TAG_variant_part",
                 0x34 => "DW_TAG_variable",
                 0x35 => "DW_TAG_volatile_type",
-                0x37 => "DW_TAG_restrict_type",
-                0x38 => "DW_TAG_interface_type",
-                0x39 => "DW_TAG_namespace",
-                0x3a => "DW_TAG_imported_module",
-                0x3b => "DW_TAG_unspecified_type",
-                0x3c => "DW_TAG_partial_unit",
-                0x3d => "DW_TAG_imported_unit",
-                // DWARF4で追加されたタグ
-                0x41 => "DW_TAG_type_unit",
-                0x42 => "DW_TAG_rvalue_reference_type",
-                0x43 => "DW_TAG_template_alias",
                 _ => "DW_TAG_unknown",
             }
-        },
-        5 => {
-            // DWARF5: 最新仕様、全機能対応
+        }
+        2 | 3 | 4 | 5 => { // DWARF 2, 3, 4, 5
             match abbrev_code {
                 0x01 => "DW_TAG_array_type",
                 0x02 => "DW_TAG_class_type",
@@ -1541,12 +2158,16 @@ fn get_die_tag_name(abbrev_code: u64, version: u16) -> &'static str {
                 0x33 => "DW_TAG_variant_part",
                 0x34 => "DW_TAG_variable",
                 0x35 => "DW_TAG_volatile_type",
+                
+                // DWARF 3 additions
                 0x36 => "DW_TAG_dwarf_procedure",
                 0x37 => "DW_TAG_restrict_type",
                 0x38 => "DW_TAG_interface_type",
                 0x39 => "DW_TAG_namespace",
                 0x3a => "DW_TAG_imported_module",
                 0x3b => "DW_TAG_unspecified_type",
+                
+                // DWARF 4 additions
                 0x3c => "DW_TAG_partial_unit",
                 0x3d => "DW_TAG_imported_unit",
                 0x3f => "DW_TAG_condition",
@@ -1554,7 +2175,8 @@ fn get_die_tag_name(abbrev_code: u64, version: u16) -> &'static str {
                 0x41 => "DW_TAG_type_unit",
                 0x42 => "DW_TAG_rvalue_reference_type",
                 0x43 => "DW_TAG_template_alias",
-                // DWARF5で追加されたタグ
+                
+                // DWARF 5 additions
                 0x44 => "DW_TAG_coarray_type",
                 0x45 => "DW_TAG_generic_subrange",
                 0x46 => "DW_TAG_dynamic_type",
@@ -1563,781 +2185,442 @@ fn get_die_tag_name(abbrev_code: u64, version: u16) -> &'static str {
                 0x49 => "DW_TAG_call_site_parameter",
                 0x4a => "DW_TAG_skeleton_unit",
                 0x4b => "DW_TAG_immutable_type",
-                _ => "DW_TAG_unknown",
-            }
-        },
-        _ => {
-            // 未対応バージョンはDWARF2形式で処理
-            match abbrev_code {
-                0x01 => "DW_TAG_array_type",
-                0x11 => "DW_TAG_compile_unit",
-                0x24 => "DW_TAG_base_type",
-                0x2e => "DW_TAG_subprogram",
-                0x34 => "DW_TAG_variable",
-                0x05 => "DW_TAG_formal_parameter",
-                0x0d => "DW_TAG_member",
-                0x13 => "DW_TAG_structure_type",
-                0x17 => "DW_TAG_union_type",
-                0x0f => "DW_TAG_pointer_type",
+                
                 _ => "DW_TAG_unknown",
             }
         }
+        _ => "Unknown DWARF version",
     }
 }
 
-// DWARFバージョンに応じた属性フォーム情報を取得
-fn get_attribute_form_info(attr_form: u64, version: u16) -> (&'static str, &'static str) {
-    // 基本的なフォーム（全バージョン共通）
-    let basic_form = match attr_form {
-        0x01 => ("DW_FORM_addr", "アドレス値"),
-        0x05 => ("DW_FORM_data2", "2バイトデータ"),
-        0x06 => ("DW_FORM_data4", "4バイトデータ"),
-        0x08 => ("DW_FORM_string", "インライン文字列"),
-        0x0b => ("DW_FORM_data1", "1バイトデータ"),
-        0x0e => ("DW_FORM_strp", "文字列ポインタ"),
-        0x11 => ("DW_FORM_ref1", "1バイト参照"),
-        0x12 => ("DW_FORM_ref2", "2バイト参照"),
-        0x13 => ("DW_FORM_ref4", "4バイト参照"),
-        _ => ("", ""),
-    };
-    
-    if !basic_form.0.is_empty() {
-        return basic_form;
-    }
-    
-    // バージョン固有のフォーム
-    match version {
-        4 | 5 => {
-            match attr_form {
-                0x17 => ("DW_FORM_sec_offset", "セクションオフセット"),
-                0x18 => ("DW_FORM_exprloc", "式ロケーション"),
-                0x19 => ("DW_FORM_flag_present", "フラグ存在"),
-                _ if version == 5 => {
-                    match attr_form {
-                        0x1a => ("DW_FORM_strx", "文字列インデックス (DWARF5)"),
-                        0x1b => ("DW_FORM_addrx", "アドレスインデックス (DWARF5)"),
-                        0x1e => ("DW_FORM_data16", "16バイトデータ (DWARF5)"),
-                        0x21 => ("DW_FORM_implicit_const", "暗黙定数 (DWARF5)"),
-                        0x22 => ("DW_FORM_loclistx", "ロケーションリストインデックス (DWARF5)"),
-                        0x23 => ("DW_FORM_rnglistx", "範囲リストインデックス (DWARF5)"),
-                        _ => ("DW_FORM_unknown", "不明なフォーム"),
-                    }
-                },
-                _ => ("DW_FORM_unknown", "不明なフォーム"),
-            }
-        },
-        _ => ("DW_FORM_unknown", "不明なフォーム"),
-    }
-}
-
-fn parse_and_display_debug_info(buffer: &[u8], section: &SectionInfo) {
-    let start_offset = section.offset as usize;
-    let section_size = section.size as usize;
-    
-    if start_offset >= buffer.len() || section_size == 0 {
-        println!("    エラー: __debug_infoセクションのデータが無効です");
-        return;
-    }
-    
-    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
-    let section_data = &buffer[start_offset..actual_end];
-    
-    println!("    === __debug_info 詳細解析 ===");
-    
-    // DWARF5準拠のコンパイル単位ヘッダーを解析
-    let unit_length = u32::from_le_bytes([
-        section_data[0], section_data[1], section_data[2], section_data[3]
-    ]);
-    let version = u16::from_le_bytes([
-        section_data[4], section_data[5]
-    ]);
-    
-    // DWARFバージョンに応じたヘッダー解析
-    let (unit_type, abbrev_offset, address_size, header_offset) = match version {
-        1 => {
-            // DWARF1: 最初のDWARF仕様、簡素なヘッダー
-            println!("    注意: DWARF1は非常に古い仕様で、限定的なサポートです");
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let address_size = 4; // DWARF1では通常4バイトアドレス
-            (None, abbrev_offset, address_size, 10)
-        },
-        2 => {
-            // DWARF2: 最初の標準化されたDWARF仕様
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let address_size = section_data[10];
-            (None, abbrev_offset, address_size, 11)
-        },
-        3 => {
-            // DWARF3: DWARF2の拡張版
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let address_size = section_data[10];
-            (None, abbrev_offset, address_size, 11)
-        },
-        4 => {
-            // DWARF4: 型シグネチャや分割DWARFのサポート
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let address_size = section_data[10];
-            (None, abbrev_offset, address_size, 11)
-        },
-        5 => {
-            // DWARF5: 最新仕様、unit_typeフィールドが追加
-            let unit_type = section_data[6];
-            let address_size = section_data[7];
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[8], section_data[9], section_data[10], section_data[11]
-            ]);
-            (Some(unit_type), abbrev_offset, address_size, 12)
-        },
-        _ => {
-            println!("    警告: 未対応のDWARFバージョン{}、DWARF2形式で解析します", version);
-            let abbrev_offset = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let address_size = section_data[10];
-            (None, abbrev_offset, address_size, 11)
-        }
-    };
-    
-    println!("    === DWARF{}準拠コンパイル単位ヘッダー ===", version);
-    println!("    ユニット長: {} バイト", unit_length);
-    println!("    DWARFバージョン: {}", version);
-    
-    if let Some(ut) = unit_type {
-        let unit_type_str = match ut {
-            0x01 => "DW_UT_compile (通常のコンパイル単位)",
-            0x02 => "DW_UT_type (型単位)",
-            0x03 => "DW_UT_partial (部分単位)",
-            0x04 => "DW_UT_skeleton (スケルトン単位)",
-            0x05 => "DW_UT_split_compile (分割コンパイル単位)",
-            0x06 => "DW_UT_split_type (分割型単位)",
-            _ => "不明な単位タイプ",
-        };
-        println!("    単位タイプ: 0x{:02x} ({})", ut, unit_type_str);
-    }
-    
-    println!("    アドレスサイズ: {} バイト", address_size);
-    println!("    省略形オフセット: 0x{:08x}", abbrev_offset);
-    
-    // 省略形テーブルを取得（__debug_abbrevセクションから）
-    let _abbrev_entries = find_abbrev_section_and_parse(buffer, abbrev_offset);
-    
-    // DIE（Debug Information Entry）を全件表示
-    let mut offset = header_offset;
-    let mut die_count = 0;
-    
-    println!("\n    --- DIE (Debug Information Entry) 一覧 ---");
-    
-    while offset < section_data.len() {
-        let (abbrev_code, consumed) = read_uleb128(&section_data[offset..]);
-        offset += consumed;
+fn get_attr_name(attr_name_code: u64) -> &'static str {
+    match attr_name_code {
+        // DWARF 2
+        0x01 => "DW_AT_sibling",
+        0x02 => "DW_AT_location",
+        0x03 => "DW_AT_name",
+        0x09 => "DW_AT_ordering",
+        0x0b => "DW_AT_byte_size",
+        0x0c => "DW_AT_bit_offset",
+        0x0d => "DW_AT_bit_size",
+        0x10 => "DW_AT_stmt_list",
+        0x11 => "DW_AT_low_pc",
+        0x12 => "DW_AT_high_pc",
+        0x13 => "DW_AT_language",
+        0x15 => "DW_AT_discr",
+        0x16 => "DW_AT_discr_value",
+        0x17 => "DW_AT_visibility",
+        0x18 => "DW_AT_import",
+        0x19 => "DW_AT_string_length",
+        0x1a => "DW_AT_common_reference",
+        0x1b => "DW_AT_comp_dir",
+        0x1c => "DW_AT_const_value",
+        0x1d => "DW_AT_containing_type",
+        0x1e => "DW_AT_default_value",
+        0x20 => "DW_AT_inline",
+        0x21 => "DW_AT_is_optional",
+        0x22 => "DW_AT_lower_bound",
+        0x25 => "DW_AT_producer",
+        0x26 => "DW_AT_prototyped",
+        0x28 => "DW_AT_return_addr",
+        0x29 => "DW_AT_start_scope",
+        0x2a => "DW_AT_stride_size",
+        0x2b => "DW_AT_upper_bound",
+        0x2c => "DW_AT_abstract_origin",
+        0x2d => "DW_AT_accessibility",
+        0x2e => "DW_AT_address_class",
+        0x2f => "DW_AT_artificial",
+        0x30 => "DW_AT_base_types",
+        0x31 => "DW_AT_calling_convention",
+        0x32 => "DW_AT_count",
+        0x33 => "DW_AT_data_member_location",
+        0x34 => "DW_AT_decl_column",
+        0x35 => "DW_AT_decl_file",
+        0x36 => "DW_AT_decl_line",
+        0x37 => "DW_AT_declaration",
+        0x38 => "DW_AT_discr_list",
+        0x39 => "DW_AT_encoding",
+        0x3a => "DW_AT_external",
+        0x3b => "DW_AT_frame_base",
+        0x3c => "DW_AT_friend",
+        0x3d => "DW_AT_identifier_case",
+        0x3e => "DW_AT_macro_info",
+        0x3f => "DW_AT_namelist_item",
+        0x40 => "DW_AT_priority",
+        0x41 => "DW_AT_segment",
+        0x42 => "DW_AT_specification",
+        0x43 => "DW_AT_static_link",
+        0x44 => "DW_AT_type",
+        0x45 => "DW_AT_use_location",
+        0x46 => "DW_AT_variable_parameter",
+        0x47 => "DW_AT_virtuality",
+        0x48 => "DW_AT_vtable_elem_location",
+        // DWARF 3
+        0x49 => "DW_AT_allocated",
+        0x4a => "DW_AT_associated",
+        0x4b => "DW_AT_data_location",
+        0x4c => "DW_AT_byte_stride",
+        0x4d => "DW_AT_entry_pc",
+        0x4e => "DW_AT_use_UTF8",
+        0x4f => "DW_AT_extension",
+        0x50 => "DW_AT_ranges",
+        0x51 => "DW_AT_trampoline",
+        0x52 => "DW_AT_call_column",
+        0x53 => "DW_AT_call_file",
+        0x54 => "DW_AT_call_line",
+        0x55 => "DW_AT_description",
+        0x56 => "DW_AT_binary_scale",
+        0x57 => "DW_AT_decimal_scale",
+        0x58 => "DW_AT_small",
+        0x59 => "DW_AT_decimal_sign",
+        0x5a => "DW_AT_digit_count",
+        0x5b => "DW_AT_picture_string",
+        0x5c => "DW_AT_mutable",
+        0x5d => "DW_AT_threads_scaled",
+        0x5e => "DW_AT_explicit",
+        0x5f => "DW_AT_object_pointer",
+        0x60 => "DW_AT_endianity",
+        0x61 => "DW_AT_elemental",
+        0x62 => "DW_AT_pure",
+        0x63 => "DW_AT_recursive",
+        // DWARF 4
+        0x64 => "DW_AT_signature",
+        0x65 => "DW_AT_main_subprogram",
+        0x66 => "DW_AT_data_bit_offset",
+        0x67 => "DW_AT_const_expr",
+        0x68 => "DW_AT_enum_class",
+        0x69 => "DW_AT_linkage_name",
+        // DWARF 5
+        0x6a => "DW_AT_string_length_bit_size",
+        0x6b => "DW_AT_string_length_byte_size",
+        0x6c => "DW_AT_rank",
+        0x6d => "DW_AT_str_offsets_base",
+        0x6e => "DW_AT_addr_base",
+        0x6f => "DW_AT_rnglists_base",
+        0x70 => "DW_AT_dwo_name",
+        0x71 => "DW_AT_reference",
+        0x72 => "DW_AT_rvalue_reference",
+        0x73 => "DW_AT_macros",
+        0x74 => "DW_AT_call_all_calls",
+        0x75 => "DW_AT_call_all_source_calls",
+        0x76 => "DW_AT_call_all_tail_calls",
+        0x77 => "DW_AT_call_return_pc",
+        0x78 => "DW_AT_call_value",
+        0x79 => "DW_AT_call_origin",
+        0x7a => "DW_AT_call_parameter",
+        0x7b => "DW_AT_call_pc",
+        0x7c => "DW_AT_call_tail_call",
+        0x7d => "DW_AT_call_target",
+        0x7e => "DW_AT_call_target_clobbered",
+        0x7f => "DW_AT_call_data_location",
+        0x80 => "DW_AT_call_data_value",
+        0x81 => "DW_AT_noreturn",
+        0x82 => "DW_AT_alignment",
+        0x83 => "DW_AT_export_symbols",
+        0x84 => "DW_AT_deleted",
+        0x85 => "DW_AT_defaulted",
+        0x86 => "DW_AT_loclists_base",
+        // GNU extensions
+        0x2101 => "DW_AT_sf_names",
+        0x2102 => "DW_AT_src_info",
+        0x2103 => "DW_AT_mac_info",
+        0x2104 => "DW_AT_src_coords",
+        0x2105 => "DW_AT_body_begin",
+        0x2106 => "DW_AT_body_end",
+        0x2107 => "DW_AT_GNU_vector",
+        0x2108 => "DW_AT_GNU_guarded_by",
+        0x2109 => "DW_AT_GNU_pt_guarded_by",
+        0x210a => "DW_AT_GNU_guarded",
+        0x210b => "DW_AT_GNU_pt_guarded",
+        0x210c => "DW_AT_GNU_locks_excluded",
+        0x210d => "DW_AT_GNU_exclusive_locks_required",
+        0x210e => "DW_AT_GNU_shared_locks_required",
+        0x210f => "DW_AT_GNU_odr_signature",
+        0x2110 => "DW_AT_GNU_template_name",
+        0x2111 => "DW_AT_GNU_call_site_value",
+        0x2112 => "DW_AT_GNU_call_site_data_value",
+        0x2113 => "DW_AT_GNU_call_site_target",
+        0x2114 => "DW_AT_GNU_call_site_target_clobbered",
+        0x2115 => "DW_AT_GNU_tail_call",
+        0x2116 => "DW_AT_GNU_all_tail_call_sites",
+        0x2117 => "DW_AT_GNU_all_call_sites",
+        0x2118 => "DW_AT_GNU_all_source_call_sites",
+        0x2119 => "DW_AT_GNU_macros",
+        0x211a => "DW_AT_GNU_deleted",
+        0x211b => "DW_AT_GNU_dwo_name",
+        0x211c => "DW_AT_GNU_dwo_id",
+        0x211d => "DW_AT_GNU_ranges_base",
+        0x211e => "DW_AT_GNU_addr_base",
+        0x211f => "DW_AT_GNU_pubnames",
+        0x2120 => "DW_AT_GNU_pubtypes",
+        0x2121 => "DW_AT_GNU_discriminator",
+        0x2122 => "DW_AT_GNU_locviews",
+        0x2123 => "DW_AT_GNU_entry_view",
         
-        if abbrev_code == 0 {
-            println!("    DIE {}: NULL DIE (終端)", die_count + 1);
-            die_count += 1;
-            continue;
-        }
+        // Apple extensions
+        0x3fe1 => "DW_AT_APPLE_optimized",
+        0x3fe2 => "DW_AT_APPLE_flags",
+        0x3fe3 => "DW_AT_APPLE_isa",
+        0x3fe4 => "DW_AT_APPLE_block",
+        0x3fe5 => "DW_AT_APPLE_major_runtime_vers",
+        0x3fe6 => "DW_AT_APPLE_runtime_class",
+        0x3fe7 => "DW_AT_APPLE_omit_frame_ptr",
+        0x3fe8 => "DW_AT_APPLE_property_name",
+        0x3fe9 => "DW_AT_APPLE_property_getter",
+        0x3fea => "DW_AT_APPLE_property_setter",
+        0x3feb => "DW_AT_APPLE_property_attribute",
+        0x3fec => "DW_AT_APPLE_objc_complete_type",
+        0x3fed => "DW_AT_APPLE_property",
         
-        // DWARFバージョンに応じたDIEタグ解析
-        let tag_name = get_die_tag_name(abbrev_code, version);
-        
-        println!("    DIE {}: 省略形コード={} ({})", die_count + 1, abbrev_code, tag_name);
-        
-        // DIEタイプ別の詳細情報を表示（DWARF5仕様準拠）
-        match tag_name {
-            // 基本的なプログラム構造
-            "DW_TAG_compile_unit" => {
-                println!("      [コンパイル単位] - ソースファイル全体の情報、翻訳単位");
-            },
-            "DW_TAG_partial_unit" => {
-                println!("      [部分単位] - 分割コンパイル用の部分的なコンパイル単位");
-            },
-            "DW_TAG_type_unit" => {
-                println!("      [型単位] - 型情報専用のコンパイル単位");
-            },
-            "DW_TAG_skeleton_unit" => {
-                println!("      [スケルトン単位] - 分割DWARF用のスケルトン単位");
-            },
-            
-            // 関数・サブプログラム
-            "DW_TAG_subprogram" => {
-                println!("      [サブプログラム] - 関数またはメソッドの定義");
-            },
-            "DW_TAG_inlined_subroutine" => {
-                println!("      [インライン関数] - インライン展開された関数");
-            },
-            "DW_TAG_entry_point" => {
-                println!("      [エントリポイント] - プログラムの開始点");
-            },
-            "DW_TAG_call_site" => {
-                println!("      [呼び出しサイト] - 関数呼び出し箇所（DWARF5）");
-            },
-            "DW_TAG_call_site_parameter" => {
-                println!("      [呼び出しパラメータ] - 関数呼び出し時の引数（DWARF5）");
-            },
-            
-            // 変数・データ
-            "DW_TAG_variable" => {
-                println!("      [変数] - グローバル変数またはローカル変数");
-            },
-            "DW_TAG_formal_parameter" => {
-                println!("      [仮引数] - 関数の引数パラメータ");
-            },
-            "DW_TAG_constant" => {
-                println!("      [定数] - コンパイル時定数値");
-            },
-            "DW_TAG_unspecified_parameters" => {
-                println!("      [可変引数] - 可変長引数（...）");
-            },
-            
-            // 基本データ型
-            "DW_TAG_base_type" => {
-                println!("      [基本型] - int, char, float等の基本データ型");
-            },
-            "DW_TAG_unspecified_type" => {
-                println!("      [未指定型] - void型や不完全型");
-            },
-            "DW_TAG_atomic_type" => {
-                println!("      [アトミック型] - C11 _Atomic型（DWARF5）");
-            },
-            "DW_TAG_immutable_type" => {
-                println!("      [不変型] - 不変性を持つ型（DWARF5）");
-            },
-            
-            // 型修飾子
-            "DW_TAG_const_type" => {
-                println!("      [const型] - const修飾された型");
-            },
-            "DW_TAG_volatile_type" => {
-                println!("      [volatile型] - volatile修飾された型");
-            },
-            "DW_TAG_restrict_type" => {
-                println!("      [restrict型] - restrict修飾された型");
-            },
-            "DW_TAG_packed_type" => {
-                println!("      [パック型] - パック属性付きの型");
-            },
-            "DW_TAG_shared_type" => {
-                println!("      [共有型] - 共有メモリ型");
-            },
-            
-            // ポインタ・参照型
-            "DW_TAG_pointer_type" => {
-                println!("      [ポインタ型] - ポインタ変数の型情報");
-            },
-            "DW_TAG_reference_type" => {
-                println!("      [参照型] - C++参照型（&）");
-            },
-            "DW_TAG_rvalue_reference_type" => {
-                println!("      [右辺値参照型] - C++11右辺値参照（&&）");
-            },
-            "DW_TAG_ptr_to_member_type" => {
-                println!("      [メンバーポインタ型] - C++メンバーポインタ");
-            },
-            
-            // 配列・コンテナ型
-            "DW_TAG_array_type" => {
-                println!("      [配列型] - 配列変数の型情報");
-            },
-            "DW_TAG_subrange_type" => {
-                println!("      [部分範囲型] - 配列の次元・範囲情報");
-            },
-            "DW_TAG_generic_subrange" => {
-                println!("      [汎用部分範囲] - 汎用的な範囲型（DWARF5）");
-            },
-            "DW_TAG_coarray_type" => {
-                println!("      [コ配列型] - Fortran coarray型（DWARF5）");
-            },
-            "DW_TAG_dynamic_type" => {
-                println!("      [動的型] - 実行時に決定される型（DWARF5）");
-            },
-            
-            // 構造体・クラス・オブジェクト指向
-            "DW_TAG_structure_type" => {
-                println!("      [構造体型] - struct定義");
-            },
-            "DW_TAG_class_type" => {
-                println!("      [クラス型] - C++クラス定義");
-            },
-            "DW_TAG_union_type" => {
-                println!("      [共用体型] - union定義");
-            },
-            "DW_TAG_interface_type" => {
-                println!("      [インターフェース型] - Java/C#インターフェース");
-            },
-            "DW_TAG_member" => {
-                println!("      [メンバー] - 構造体またはクラスのメンバー変数");
-            },
-            "DW_TAG_inheritance" => {
-                println!("      [継承] - クラス継承関係");
-            },
-            "DW_TAG_friend" => {
-                println!("      [フレンド] - C++フレンド宣言");
-            },
-            "DW_TAG_access_declaration" => {
-                println!("      [アクセス宣言] - アクセス修飾子宣言");
-            },
-            
-            // 列挙型
-            "DW_TAG_enumeration_type" => {
-                println!("      [列挙型] - enum定義");
-            },
-            "DW_TAG_enumerator" => {
-                println!("      [列挙子] - enum値の個別要素");
-            },
-            
-            // 関数型・サブルーチン型
-            "DW_TAG_subroutine_type" => {
-                println!("      [サブルーチン型] - 関数ポインタの型情報");
-            },
-            "DW_TAG_string_type" => {
-                println!("      [文字列型] - 言語固有の文字列型");
-            },
-            "DW_TAG_file_type" => {
-                println!("      [ファイル型] - ファイルハンドル型");
-            },
-            "DW_TAG_set_type" => {
-                println!("      [集合型] - Pascal等の集合型");
-            },
-            
-            // 型定義・エイリアス
-            "DW_TAG_typedef" => {
-                println!("      [型定義] - typedef宣言による型エイリアス");
-            },
-            
-            // テンプレート・ジェネリクス
-            "DW_TAG_template_type_parameter" => {
-                println!("      [テンプレート型パラメータ] - C++テンプレート型引数");
-            },
-            "DW_TAG_template_value_parameter" => {
-                println!("      [テンプレート値パラメータ] - C++テンプレート値引数");
-            },
-            "DW_TAG_template_alias" => {
-                println!("      [テンプレートエイリアス] - C++11 using宣言");
-            },
-            
-            // 名前空間・モジュール
-            "DW_TAG_namespace" => {
-                println!("      [名前空間] - C++名前空間");
-            },
-            "DW_TAG_module" => {
-                println!("      [モジュール] - Fortran/Ada等のモジュール");
-            },
-            "DW_TAG_imported_declaration" => {
-                println!("      [インポート宣言] - using宣言");
-            },
-            "DW_TAG_imported_module" => {
-                println!("      [インポートモジュール] - モジュールインポート");
-            },
-            "DW_TAG_imported_unit" => {
-                println!("      [インポート単位] - 単位インポート");
-            },
-            
-            // 制御構造・ブロック
-            "DW_TAG_lexical_block" => {
-                println!("      [字句ブロック] - {{}}で囲まれたスコープ");
-            },
-            "DW_TAG_label" => {
-                println!("      [ラベル] - goto文のラベル");
-            },
-            "DW_TAG_with_stmt" => {
-                println!("      [with文] - Pascal等のwith文");
-            },
-            "DW_TAG_try_block" => {
-                println!("      [try文] - 例外処理のtryブロック");
-            },
-            "DW_TAG_catch_block" => {
-                println!("      [catch文] - 例外処理のcatchブロック");
-            },
-            "DW_TAG_thrown_type" => {
-                println!("      [例外型] - throw文で投げられる例外の型");
-            },
-            
-            // バリアント・共用体関連
-            "DW_TAG_variant" => {
-                println!("      [バリアント] - 判別共用体の選択肢");
-            },
-            "DW_TAG_variant_part" => {
-                println!("      [バリアント部] - 判別共用体の本体");
-            },
-            
-            // 共通ブロック（Fortran等）
-            "DW_TAG_common_block" => {
-                println!("      [共通ブロック] - Fortran COMMON文");
-            },
-            "DW_TAG_common_inclusion" => {
-                println!("      [共通ブロック包含] - COMMON文の包含");
-            },
-            
-            // 名前リスト（Fortran等）
-            "DW_TAG_namelist" => {
-                println!("      [名前リスト] - Fortran NAMELIST文");
-            },
-            "DW_TAG_namelist_item" => {
-                println!("      [名前リスト項目] - NAMELIST項目");
-            },
-            
-            // DWARF手続き・条件
-            "DW_TAG_dwarf_procedure" => {
-                println!("      [DWARF手続き] - DWARF式で使用する手続き");
-            },
-            "DW_TAG_condition" => {
-                println!("      [条件] - 条件式");
-            },
-            
-            _ => {
-                println!("      [その他] - {}", tag_name);
-            }
-        }
-        
-        // 属性値を読み取り（詳細版）
-        let mut attr_count = 0;
-        println!("      詳細属性情報:");
-        while offset < section_data.len() && attr_count < 8 {
-            let (attr_value, consumed) = read_uleb128(&section_data[offset..]);
-            offset += consumed;
-            
-            if attr_value == 0 {
-                break;
-            }
-            
-            // 属性値の意味を推定して表示（詳細デバッグ情報付き）
-            let attr_description = match attr_count {
-                0 => {
-                    // 最初の属性は通常名前やコンパイラ情報 (DW_AT_producer)
-                    if attr_value < 0x1000 {
-                        format!("文字列インデックス: {} (DW_AT_producer - コンパイラ情報)", attr_value)
-                    } else {
-                        format!("アドレス: 0x{:08x} (DW_AT_producer - コンパイラ情報)", attr_value)
-                    }
-                },
-                1 => {
-                    // 2番目の属性はDW_AT_language（DWARF言語コード）
-                    // 注意: Apple clangの場合、標準DWARF仕様と異なる場合があります
-                    let language_str = match attr_value {
-                        // DWARF 5公式仕様に基づく標準言語コード
-                        1 => "C89言語 (DW_LANG_C89)",
-                        2 => "C言語 (DW_LANG_C)",
-                        3 => "Ada83 (DW_LANG_Ada83)",
-                        4 => "C++言語 (DW_LANG_C_plus_plus)",
-                        5 => "Cobol74 (DW_LANG_Cobol74)",
-                        6 => "Cobol85 (DW_LANG_Cobol85)",
-                        7 => "Fortran77 (DW_LANG_Fortran77)",
-                        8 => "Fortran90 (DW_LANG_Fortran90)",
-                        9 => "Pascal83 (DW_LANG_Pascal83)",
-                        10 => "Modula2 (DW_LANG_Modula2)",
-                        11 => "Java言語 (DW_LANG_Java)",
-                        12 => "C99言語 (DW_LANG_C99)",
-                        13 => "Ada95 (DW_LANG_Ada95)",
-                        14 => "Fortran95 (DW_LANG_Fortran95)",
-                        15 => "PLI (DW_LANG_PLI)",
-                        16 => "ObjC言語 (DW_LANG_ObjC)",
-                        17 => "ObjC++言語 (DW_LANG_ObjC_plus_plus)",
-                        18 => "UPC (DW_LANG_UPC)",
-                        19 => "D言語 (DW_LANG_D)",
-                        20 => "Python言語 (DW_LANG_Python)",
-                        21 => "OpenCL (DW_LANG_OpenCL)",
-                        22 => "Go言語 (DW_LANG_Go)",
-                        23 => "Modula3 (DW_LANG_Modula3)",
-                        24 => "Haskell言語 (DW_LANG_Haskell)",
-                        25 => "C++03言語 (DW_LANG_C_plus_plus_03)",
-                        26 => "C++11言語 (DW_LANG_C_plus_plus_11)",
-                        27 => "OCaml言語 (DW_LANG_OCaml)",
-                        28 => "Rust言語 (DW_LANG_Rust)",
-                        29 => "C11言語 (DW_LANG_C11)",
-                        30 => "Swift言語 (DW_LANG_Swift)",
-                        31 => "Julia言語 (DW_LANG_Julia)",
-                        32 => "Dylan言語 (DW_LANG_Dylan)",
-                        33 => "C++14言語 (DW_LANG_C_plus_plus_14)",
-                        34 => "Fortran03 (DW_LANG_Fortran03)",
-                        35 => "Fortran08 (DW_LANG_Fortran08)",
-                        36 => "RenderScript (DW_LANG_RenderScript)",
-                        37 => "BLISS (DW_LANG_BLISS)",
-                        
-                        // DWARF 5以降に追加された言語コード
-                        38 => "Kotlin言語 (DW_LANG_Kotlin)",
-                        39 => "Zig言語 (DW_LANG_Zig)",
-                        40 => "Crystal言語 (DW_LANG_Crystal)",
-                        41 => "C++17言語 (DW_LANG_C_plus_plus_17)",
-                        42 => "C++20言語 (DW_LANG_C_plus_plus_20)",
-                        43 => "C17言語 (DW_LANG_C17)",
-                        44 => "Fortran18 (DW_LANG_Fortran18)",
-                        45 => "Ada2005 (DW_LANG_Ada2005)",
-                        46 => "Ada2012 (DW_LANG_Ada2012)",
-                        47 => "HIP (DW_LANG_HIP)",
-                        48 => "Assembly (DW_LANG_Assembly)",
-                        49 => "C#言語 (DW_LANG_C_sharp)",
-                        50 => "Mojo言語 (DW_LANG_Mojo)",
-                        51 => "GLSL (DW_LANG_GLSL)",
-                        52 => "GLSL ES (DW_LANG_GLSL_ES)",
-                        53 => "HLSL (DW_LANG_HLSL)",
-                        54 => "OpenCL C++ (DW_LANG_OpenCL_CPP)",
-                        55 => "C++ for OpenCL (DW_LANG_CPP_for_OpenCL)",
-                        56 => "SYCL (DW_LANG_SYCL)",
-                        57 => "C++23言語 (DW_LANG_C_plus_plus_23)",
-                        58 => "Odin言語 (DW_LANG_Odin)",
-                        59 => "P4 (DW_LANG_P4)",
-                        60 => "Metal (DW_LANG_Metal)",
-                        61 => "C23言語 (DW_LANG_C23)",
-                        62 => "Fortran23 (DW_LANG_Fortran23)",
-                        63 => "Ruby言語 (DW_LANG_Ruby)",
-                        64 => "Move (DW_LANG_Move)",
-                        65 => "Hylo (DW_LANG_Hylo)",
-                        66 => "V言語 (DW_LANG_V)",
-                        67 => "Algol68 (DW_LANG_Algol68)",
-                        68 => "Nim言語 (DW_LANG_Nim)",
-                        _ => {
-                            if attr_value < 100 {
-                                "未定義言語 (DWARFコード低値)"
-                            } else if attr_value >= 0x8000 {
-                                "ベンダー拡張言語"
-                            } else {
-                                "不明な言語コード"
-                            }
-                        },
-                    };
-                    format!("{} (DW_AT_language)", language_str)
-                },
-                2 => {
-                    // 3番目はファイルパスやディレクトリ情報 (DW_AT_nameまたはDW_AT_comp_dir)
-                    format!("パスインデックス: {}", attr_value)
-                },
-                3 => {
-                    // 4番目はサイズやオフセット情報 (DW_AT_byte_sizeまたはDW_AT_stmt_list)
-                    if attr_value < 0x10000 {
-                        format!("サイズ: {} バイト (DW_AT_byte_size - データサイズ)", attr_value)
-                    } else {
-                        format!("オフセット: 0x{:08x} (DW_AT_stmt_list - 行番号テーブル)", attr_value)
-                    }
-                },
-                4 => {
-                    // 5番目はアドレスやエンコーディング情報 (DW_AT_low_pcまたはDW_AT_encoding)
-                    if attr_value < 0x100 {
-                        let encoding_str = match attr_value {
-                            1 => "符号付き (DW_ATE_signed)",
-                            2 => "符号なし (DW_ATE_unsigned)",
-                            3 => "ブール型 (DW_ATE_boolean)",
-                            4 => "浮動小数点 (DW_ATE_float)",
-                            5 => "文字 (DW_ATE_signed_char)",
-                            6 => "符号なし文字 (DW_ATE_unsigned_char)",
-                            7 => "虚数 (DW_ATE_imaginary_float)",
-                            8 => "小数 (DW_ATE_packed_decimal)",
-                            9 => "数値 (DW_ATE_numeric_string)",
-                            10 => "編集済み (DW_ATE_edited)",
-                            11 => "符号付き固定小数点 (DW_ATE_signed_fixed)",
-                            12 => "符号なし固定小数点 (DW_ATE_unsigned_fixed)",
-                            13 => "10進浮動小数点 (DW_ATE_decimal_float)",
-                            14 => "UTF文字 (DW_ATE_UTF)",
-                            _ => "不明なエンコーディング",
-                        };
-                        format!("エンコーディング: {} (DW_AT_encoding)", encoding_str)
-                    } else {
-                        format!("開始アドレス: 0x{:08x} (DW_AT_low_pc - 関数開始位置)", attr_value)
-                    }
-                },
-                5 => {
-                    // 6番目は終了アドレスやオフセット情報 (DW_AT_high_pcまたはDW_AT_data_member_location)
-                    if attr_value < 0x1000 {
-                        format!("オフセット: {} バイト (DW_AT_data_member_location - メンバー位置)", attr_value)
-                    } else {
-                        format!("終了アドレス: 0x{:08x} (DW_AT_high_pc - 関数終了位置)", attr_value)
-                    }
-                },
-                6 => {
-                    // 7番目は型参照やフレームベース情報 (DW_AT_typeまたはDW_AT_frame_base)
-                    if attr_value < 0x100 {
-                        format!("フレームベース: {} (DW_AT_frame_base - スタックフレーム)", attr_value)
-                    } else {
-                        format!("型参照: 0x{:08x} (DW_AT_type - データ型参照)", attr_value)
-                    }
-                },
-                7 => {
-                    // 8番目は可視性やアクセシビリティ情報 (DW_AT_externalまたはDW_AT_accessibility)
-                    if attr_value == 1 {
-                        format!("外部可視: はい (DW_AT_external - グローバルシンボル)")
-                    } else if attr_value == 0 {
-                        format!("外部可視: いいえ (DW_AT_external - ローカルシンボル)")
-                    } else {
-                        let access_str = match attr_value {
-                            1 => "パブリック (DW_ACCESS_public)",
-                            2 => "プロテクテッド (DW_ACCESS_protected)",
-                            3 => "プライベート (DW_ACCESS_private)",
-                            _ => "不明なアクセシビリティ",
-                        };
-                        format!("アクセシビリティ: {} (DW_AT_accessibility)", access_str)
-                    }
-                },
-                _ => {
-                    // その他の属性は汎用的な解釈を行う
-                    if attr_value == 0 {
-                        format!("値: 0 (NULLまたは無効)")
-                    } else if attr_value == 1 {
-                        format!("値: 1 (TRUEまたは有効)")
-                    } else if attr_value < 0x100 {
-                        format!("小さな値: {} (インデックスまたはサイズ)", attr_value)
-                    } else if attr_value < 0x10000 {
-                        format!("中程度の値: {} (0x{:04x} - オフセットまたはサイズ)", attr_value, attr_value)
-                    } else {
-                        format!("大きな値: 0x{:08x} ({} - アドレスまたはポインタ)", attr_value, attr_value)
-                    }
-                },
-            };
-            
-            println!("        • 属性{}: {}", attr_count + 1, attr_description);
-            attr_count += 1;
-        }
-        
-        if attr_count == 0 {
-            println!("        • 属性なし");
-        }
-        
-        die_count += 1;
-        
-        // 安全のため、一定のオフセットを超えたら停止
-        if offset > 200 {
-            break;
-        }
+        // LLVM extensions
+        0x3fee => "DW_AT_LLVM_include_path",
+        0x3fef => "DW_AT_LLVM_config_macros",
+        0x3ff0 => "DW_AT_LLVM_sysroot",
+        0x3ff1 => "DW_AT_LLVM_tag_offset",
+        0x3ff2 => "DW_AT_LLVM_apinotes",
+        0x3ff3 => "DW_AT_LLVM_active_lane",
+        0x3ff4 => "DW_AT_LLVM_augmentation",
+        0x3ff5 => "DW_AT_LLVM_lanes",
+        0x3ff6 => "DW_AT_LLVM_lane_pc",
+        0x3ff7 => "DW_AT_LLVM_vector_size",
+        _ => "Unknown or custom attribute",
     }
 }
 
-fn parse_and_display_debug_str(buffer: &[u8], section: &SectionInfo) {
-    let start_offset = section.offset as usize;
-    let section_size = section.size as usize;
-    
-    if start_offset >= buffer.len() || section_size == 0 {
-        println!("    エラー: __debug_strセクションのデータが無効です");
-        return;
+fn get_language_name(lang_code: u64) -> &'static str {
+    match lang_code {
+        0x0001 => "DW_LANG_C89",
+        0x0002 => "DW_LANG_C",
+        0x0003 => "DW_LANG_Ada83",
+        0x0004 => "DW_LANG_C_plus_plus",
+        0x0005 => "DW_LANG_Cobol74",
+        0x0006 => "DW_LANG_Cobol85",
+        0x0007 => "DW_LANG_Fortran77",
+        0x0008 => "DW_LANG_Fortran90",
+        0x0009 => "DW_LANG_Pascal83",
+        0x000a => "DW_LANG_Modula2",
+        0x000b => "DW_LANG_Java",
+        0x000c => "DW_LANG_C99",
+        0x000d => "DW_LANG_Ada95",
+        0x000e => "DW_LANG_Fortran95",
+        0x000f => "DW_LANG_PLI",
+        0x0010 => "DW_LANG_ObjC",
+        0x0011 => "DW_LANG_ObjC_plus_plus",
+        0x0012 => "DW_LANG_UPC",
+        0x0013 => "DW_LANG_D",
+        0x0014 => "DW_LANG_Python",
+        0x0015 => "DW_LANG_OpenCL",
+        0x0016 => "DW_LANG_Go",
+        0x0017 => "DW_LANG_Modula3",
+        0x0018 => "DW_LANG_Haskell",
+        0x0019 => "DW_LANG_C_plus_plus_03",
+        0x001a => "DW_LANG_C_plus_plus_11",
+        0x001b => "DW_LANG_OCaml",
+        0x001c => "DW_LANG_Rust",
+        0x001d => "DW_LANG_C11",
+        0x001e => "DW_LANG_Swift",
+        0x001f => "DW_LANG_Julia",
+        0x0020 => "DW_LANG_Dylan",
+        0x0021 => "DW_LANG_C_plus_plus_14",
+        0x0022 => "DW_LANG_Fortran03",
+        0x0023 => "DW_LANG_Fortran08",
+        0x0024 => "DW_LANG_RenderScript",
+        0x0025 => "DW_LANG_BLISS",
+        0x0026 => "DW_LANG_Kotlin",
+        0x0027 => "DW_LANG_Zig",
+        0x0028 => "DW_LANG_Crystal",
+        0x0029 => "DW_LANG_C_plus_plus_17",
+        0x002a => "DW_LANG_C_plus_plus_20",
+        0x002b => "DW_LANG_C17",
+        0x002c => "DW_LANG_Fortran18",
+        0x002d => "DW_LANG_Ada2005",
+        0x002e => "DW_LANG_Ada2012",
+        0x8001 => "DW_LANG_Mips_Assembler",
+        0x8002 => "DW_LANG_GOOGLE_RenderScript",
+        0x8003 => "DW_LANG_SUN_Assembler",
+        _ => "Unknown Language",
     }
-    
-    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
-    let section_data = &buffer[start_offset..actual_end];
-    
-    println!("    === __debug_str 詳細解析 ===");
-    println!("    文字列テーブルサイズ: {} バイト", section_size);
-    
-    // 文字列を抽出して全件表示
-    let mut offset = 0;
-    let mut string_count = 0;
-    
-    println!("\n    --- 文字列一覧 ---");
-    
-    while offset < section_data.len() {
-        let (string, consumed) = extract_null_terminated_string(&section_data[offset..]);
+}
+
+fn get_language_description(lang_code: u64) -> &'static str {
+    match lang_code {
+        0x0001 => "C89コンパイラ (ANSI C 1989)",
+        0x0002 => "Cコンパイラ (K&R C または C90)",
+        0x0003 => "Ada83コンパイラ",
+        0x0004 => "C++コンパイラ (初期版)",
+        0x0005 => "COBOL74コンパイラ",
+        0x0006 => "COBOL85コンパイラ",
+        0x0007 => "Fortran77コンパイラ",
+        0x0008 => "Fortran90コンパイラ",
+        0x0009 => "Pascal83コンパイラ",
+        0x000a => "Modula-2コンパイラ",
         
-        if !string.is_empty() {
-            println!("    {}: [0x{:04x}] {}", string_count, offset, string);
-            string_count += 1;
-        }
+        // DWARF 3
+        0x000b => "Javaコンパイラ (javac)",
+        0x000c => "C99コンパイラ (ISO C 1999)",
+        0x000d => "Ada95コンパイラ",
+        0x000e => "Fortran95コンパイラ",
+        0x000f => "PL/Iコンパイラ",
+        0x0010 => "Objective-Cコンパイラ (clang/gcc)",
+        0x0011 => "Objective-C++コンパイラ",
+        0x0012 => "UPCコンパイラ (Unified Parallel C)",
+        0x0013 => "Dコンパイラ (dmd/gdc/ldc)",
         
-        offset += consumed;
+        // DWARF 4
+        0x0014 => "Pythonインタープリター/コンパイラ (CPython/PyPy)",
+        0x0015 => "OpenCLコンパイラ",
+        0x0016 => "Goコンパイラ (gc/gccgo)",
+        0x0017 => "Modula-3コンパイラ",
+        0x0018 => "Haskellコンパイラ (GHC)",
+        0x0019 => "C++03コンパイラ (ISO C++ 2003)",
+        0x001a => "C++11コンパイラ (ISO C++ 2011)",
+        0x001b => "OCamlコンパイラ",
         
-        if consumed == 0 {
-            break;
-        }
+        // DWARF 5
+        0x001c => "Rustコンパイラ (rustc)",
+        0x001d => "C11コンパイラ (ISO C 2011)",
+        0x001e => "Swiftコンパイラ (swiftc)",
+        0x001f => "Juliaコンパイラ/JIT",
+        0x0020 => "Dylanコンパイラ",
+        0x0021 => "C++14コンパイラ (ISO C++ 2014)",
+        0x0022 => "Fortran03コンパイラ (ISO Fortran 2003)",
+        0x0023 => "Fortran08コンパイラ (ISO Fortran 2008)",
+        0x0024 => "RenderScriptコンパイラ (Android)",
+        0x0025 => "BLISSコンパイラ",
+        0x0026 => "Kotlinコンパイラ (kotlinc)",
+        0x0027 => "Zigコンパイラ (zig)",
+        0x0028 => "Crystalコンパイラ",
+        0x0029 => "C++17コンパイラ (ISO C++ 2017)",
+        0x002a => "C++20コンパイラ (ISO C++ 2020)",
+        0x002b => "C17コンパイラ (ISO C 2018)",
+        0x002c => "Fortran18コンパイラ (ISO Fortran 2018)",
+        0x002d => "Ada2005コンパイラ (ISO Ada 2005)",
+        0x002e => "Ada2012コンパイラ (ISO Ada 2012)",
+        
+        _ => "不明なコンパイラ",
     }
-    
-    if string_count == 0 {
-        println!("    (文字列が見つかりませんでした)");
+}
+
+fn get_form_name(form_code: u64) -> &'static str {
+    match form_code {
+        // DWARF 2
+        0x01 => "DW_FORM_addr",
+        0x03 => "DW_FORM_block2",
+        0x04 => "DW_FORM_block4",
+        0x05 => "DW_FORM_data2",
+        0x06 => "DW_FORM_data4",
+        0x07 => "DW_FORM_data8",
+        0x08 => "DW_FORM_string",
+        0x09 => "DW_FORM_block",
+        0x0a => "DW_FORM_block1",
+        0x0b => "DW_FORM_data1",
+        0x0c => "DW_FORM_flag",
+        0x0d => "DW_FORM_sdata",
+        0x0e => "DW_FORM_strp",
+        0x0f => "DW_FORM_udata",
+        0x10 => "DW_FORM_ref_addr",
+        0x11 => "DW_FORM_ref1",
+        0x12 => "DW_FORM_ref2",
+        0x13 => "DW_FORM_ref4",
+        0x14 => "DW_FORM_ref8",
+        0x15 => "DW_FORM_ref_udata",
+        0x16 => "DW_FORM_indirect",
+        
+        // DWARF 3
+        0x17 => "DW_FORM_sec_offset",
+        0x18 => "DW_FORM_exprloc",
+        0x19 => "DW_FORM_flag_present",
+        
+        // DWARF 4
+        0x1a => "DW_FORM_strx",
+        0x1b => "DW_FORM_addrx",
+        0x1c => "DW_FORM_ref_sup4",
+        0x1d => "DW_FORM_strp_sup",
+        0x1e => "DW_FORM_data16",
+        0x1f => "DW_FORM_line_strp",
+        
+        // DWARF 5
+        0x20 => "DW_FORM_ref_sig8",
+        0x21 => "DW_FORM_implicit_const",
+        0x22 => "DW_FORM_loclistx",
+        0x23 => "DW_FORM_rnglistx",
+        0x24 => "DW_FORM_ref_sup8",
+        0x25 => "DW_FORM_strx1",
+        0x26 => "DW_FORM_strx2",
+        0x27 => "DW_FORM_strx3",
+        0x28 => "DW_FORM_strx4",
+        0x29 => "DW_FORM_addrx1",
+        0x2a => "DW_FORM_addrx2",
+        0x2b => "DW_FORM_addrx3",
+        0x2c => "DW_FORM_addrx4",
+        
+        _ => "DW_FORM_unknown",
     }
 }
 
 fn parse_and_display_debug_abbrev(buffer: &[u8], section: &SectionInfo, version: u16) {
     let start_offset = section.offset as usize;
     let section_size = section.size as usize;
-    
+
     if start_offset >= buffer.len() || section_size == 0 {
-        println!("    エラー: __debug_abbrevセクションのデータが無効です");
+        println!("エラー: __debug_abbrevセクションのデータが無効です");
         return;
     }
-    
+
     let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
     let section_data = &buffer[start_offset..actual_end];
-    
-    println!("    === __debug_abbrev 詳細解析 ===");
-    
+
+    println!("Abbrev table for offset: 0x{:08x}", 0);
+
     let mut offset = 0;
-    let mut abbrev_count = 0;
-    
-    println!("    --- 省略形エントリ ---");
-    
+
     while offset < section_data.len() {
         let (abbrev_code, consumed) = read_uleb128(&section_data[offset..]);
         offset += consumed;
-        
+
         if abbrev_code == 0 {
-            abbrev_count += 1;
+            if offset >= section_data.len() || section_data[offset..].iter().all(|&b| b == 0) {
+                break;
+            }
             continue;
         }
-        
+
         if offset >= section_data.len() {
             break;
         }
-        
-        let (tag, consumed) = read_uleb128(&section_data[offset..]);
+
+        let (tag_code, consumed) = read_uleb128(&section_data[offset..]);
         offset += consumed;
+        let tag_name = get_die_tag_name(tag_code, version);
         
-        if offset >= section_data.len() {
-            break;
-        }
-        
-        let has_children = section_data[offset];
-        offset += 1;
-        
-        let tag_name = match tag {
-            17 => "DW_TAG_compile_unit",
-            46 => "DW_TAG_subprogram",
-            52 => "DW_TAG_variable",
-            36 => "DW_TAG_base_type",
-            19 => "DW_TAG_structure_type",
-            21 => "DW_TAG_union_type",
-            22 => "DW_TAG_enumeration_type",
-            15 => "DW_TAG_pointer_type",
-            38 => "DW_TAG_const_type",
-            53 => "DW_TAG_volatile_type",
-            _ => "未知のタグ",
-        };
-        
-        println!("    {}: コード={} タグ={} ({}) {}",
-                 abbrev_count + 1, abbrev_code, tag, tag_name,
-                 if has_children == 1 { "子あり" } else { "子なし" });
-        
-        // 属性リストを読み取り（最初の数個のみ）
-        let mut attr_count = 0;
-        while offset + 1 < section_data.len() && attr_count < 3 {
-            let (attr_name, consumed) = read_uleb128(&section_data[offset..]);
-            offset += consumed;
-            
-            if attr_name == 0 {
-                let (attr_form, consumed) = read_uleb128(&section_data[offset..]);
-                offset += consumed;
-                if attr_form == 0 {
-                    break;
-                }
-            } else {
-                let (attr_form, consumed) = read_uleb128(&section_data[offset..]);
-                offset += consumed;
-                
-                let attr_name_str = dwarf_attr_to_string(attr_name);
-        // DWARFバージョンに応じた属性フォーム解析
-        let (form_str, form_description) = get_attribute_form_info(attr_form, version);
-        println!("      属性: {} | フォーム: {} ({})", attr_name_str, form_str, form_description);
-                attr_count += 1;
+        let (has_children_val, consumed) = read_uleb128(&section_data[offset..]);
+        offset += consumed;
+        let has_children = if has_children_val != 0 { "DW_CHILDREN_yes" } else { "DW_CHILDREN_no" };
+
+        println!("[{}] {}\t{}", abbrev_code, tag_name, has_children);
+
+        loop {
+            if offset >= section_data.len() {
+                break;
             }
+
+            let (attr_name_code, consumed) = read_uleb128(&section_data[offset..]);
+            offset += consumed;
+
+            let (attr_form_code, consumed) = read_uleb128(&section_data[offset..]);
+            offset += consumed;
+
+            if attr_name_code == 0 && attr_form_code == 0 {
+                break;
+            }
+
+            let attr_name = get_attr_name(attr_name_code);
+            let form_name = get_form_name(attr_form_code);
+
+            println!("\t{}\t{}", attr_name, form_name);
         }
         
-        abbrev_count += 1;
-        
-        // 安全のため制限
-        if offset > 500 {
-            break;
-        }
+        println!();
     }
 }
 
@@ -2352,11 +2635,6 @@ fn parse_and_display_debug_aranges(buffer: &[u8], section: &SectionInfo) {
     
     let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
     let section_data = &buffer[start_offset..actual_end];
-    
-    if section_data.len() < 12 {
-        println!("    エラー: __debug_arangesセクションが小さすぎます");
-        return;
-    }
     
     println!("    === __debug_aranges 詳細解析 ===");
     
@@ -2473,6 +2751,211 @@ fn parse_and_display_eh_frame(_buffer: &[u8], section: &SectionInfo) {
     println!("    (例外処理フレーム情報の詳細解析は未実装)");
 }
 
+fn display_stubs_and_following_section(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
+
+    // __stubsセクション取得
+    let stubs_section = match find_section_by_name(sections, "__stubs") {
+        Some(s) => s,
+        None => {
+            println!("__stubsセクションが見つかりません");
+            return;
+        }
+    };
+    println!("\n=== __stubs セクション内容 ===");
+    display_section_hexdump(buffer, stubs_section);
+
+    // ファイルオフセット順で__stubs直後のセクションを探す
+    let stubs_end = stubs_section.offset as u64 + stubs_section.size;
+    let mut following: Option<&SectionInfo> = None;
+    let mut min_offset = u64::MAX;
+    for s in sections.values() {
+        if s.offset as u64 >= stubs_end && (s.offset as u64) < min_offset && s.offset != stubs_section.offset {
+            min_offset = s.offset as u64;
+            following = Some(s);
+        }
+    }
+    if let Some(sec) = following {
+        println!("\n=== __stubs直後のセクション [{}] ({}) ===", sec.name, sec.seg_name);
+        display_section_hexdump(buffer, sec);
+    } else {
+        println!("__stubs直後のセクションは見つかりませんでした");
+    }
+}
+
+fn display_section_hexdump(buffer: &[u8], section: &SectionInfo) {
+    println!("セクション: {} (セグメント: {})", section.name, section.seg_name);
+    println!("  ファイルオフセット: 0x{:08x}", section.offset);
+    println!("  サイズ: {} バイト", section.size);
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("  エラー: セクションデータが無効です");
+        return;
+    }
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    let max_dump = std::cmp::min(section_data.len(), 512); // 最大512バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("    {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    if section_data.len() > max_dump {
+        println!("    ... (省略。全体: {} バイト)", section_data.len());
+    }
+}
+
+fn display_unwind_info_section(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __unwind_info セクション内容 ===");
+    display_section_hexdump(buffer, section);
+}
+
+fn display_got_section(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __got セクション内容 ===");
+    display_section_hexdump(buffer, section);
+}
+
+fn display_stubs_section(buffer: &[u8], section: &SectionInfo, is_64: bool) {
+    if is_64 {
+        println!("\n=== __stubs セクション内容 (64ビットバイナリ) ===");
+        println!("※ オフセット解釈は32ビット(u32, 4バイト単位)固定です");
+    } else {
+        println!("\n=== __stubs セクション内容 (32ビットバイナリ) ===");
+        println!("※ オフセット解釈は32ビット(u32, 4バイト単位)です");
+    }
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __stubsセクションのデータが無効です");
+        return;
+    }
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    let max_dump = std::cmp::min(section_data.len(), 512); // 最大512バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("  {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    if section_data.len() > max_dump {
+        println!("  ... (省略。全体: {} バイト)", section_data.len());
+    }
+    println!("  (offset: 0x{:x}, size: {}バイト)", section.offset, section.size);
+
+    // --- 追加: 各ワード値をオフセットとして文字列取得 ---
+    println!("\n");
+    let word_size = 4; // 32ビット固定
+    if section_data.len() < word_size {
+        println!("  __stubsセクションが短すぎます");
+        return;
+    }
+    // 最初の値＝文字列テーブルの先頭
+    let strtab_offset = u32::from_le_bytes(section_data[0..4].try_into().unwrap()) as usize;
+    if strtab_offset < buffer.len() {
+        let mut end = strtab_offset;
+        while end < buffer.len() && buffer[end] != 0 {
+            end += 1;
+        }
+        let s = &buffer[strtab_offset..end];
+        if let Ok(s) = std::str::from_utf8(s) {
+            println!("  先頭文字列: '{}'", s);
+        } else {
+            println!("  先頭文字列: (非UTF8)");
+        }
+    }
+
+
+    // --- __stubs命令列の簡易解析 ---
+    println!("\n[__stubs命令列の簡易解析]");
+    // Mach-Oヘッダからアーキテクチャ判定（x86_64/arm64のみ対応）
+    // ※本来はheaderからcputypeを渡すのが理想だが、ここではバイト長から推定
+    // x86_64: 6バイト単位、arm64: 12バイト単位が多い
+    // まずx86_64パターン
+    let mut addr = section.addr;
+    let mut offset = 0;
+    while offset + 6 <= section_data.len() {
+        // x86_64: ff 25 xx xx xx xx (jmp *rip+xx)
+        if section_data[offset] == 0xff && section_data[offset+1] == 0x25 {
+            let disp = u32::from_le_bytes([section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5]]);
+            println!("  0x{:08x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}    jmp QWORD PTR [rip+0x{:x}]", addr, section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5], disp);
+            offset += 6;
+            addr += 6;
+            continue;
+        }
+        // ARM64: adrp/add/ldr/brパターン（12バイト）
+        if offset + 12 <= section_data.len() {
+            // 例: adrp, add, ldr, br
+            let adrp = u32::from_le_bytes([section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3]]);
+            let add  = u32::from_le_bytes([section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7]]);
+            let ldr  = u32::from_le_bytes([section_data[offset+8], section_data[offset+9], section_data[offset+10], section_data[offset+11]]);
+            // 簡易判定: adrp命令は上位8bitが0x90~0x91、ldr命令は0xf9
+            if (adrp & 0x9f000000) == 0x90000000 && (ldr & 0xff000000) == 0xf9000000 {
+                println!("  0x{:08x}: {:02x}...{:02x}    ARM64スタブ(adrp/add/ldr): 12バイト", addr, section_data[offset], section_data[offset+11]);
+                offset += 12;
+                addr += 12;
+                continue;
+            }
+        }
+        // それ以外はバイト表示のみ
+        println!("  0x{:08x}: {:02x}", addr, section_data[offset]);
+        offset += 1;
+        addr += 1;
+    }
+}
+
+
+
+fn display_apple_names_section(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __apple_names セクション内容 ===");
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __apple_namesセクションのデータが無効です");
+        return;
+    }
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    let max_dump = std::cmp::min(section_data.len(), 512); // 最大512バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("  {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    if section_data.len() > max_dump {
+        println!("  ... (省略。全体: {} バイト)", section_data.len());
+    }
+}
+
 fn parse_and_display_debug_line_str(buffer: &[u8], section: &SectionInfo) {
     println!("    === __debug_line_str 詳細解析 ===");
     let start_offset = section.offset as usize;
@@ -2516,189 +2999,277 @@ fn parse_and_display_debug_line_str(buffer: &[u8], section: &SectionInfo) {
     }
 }
 
-fn read_uleb128(data: &[u8]) -> (u64, usize) {
-    let mut result = 0u64;
-    let mut shift = 0;
-    let mut bytes_read = 0;
-    
-    for &byte in data {
-        bytes_read += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        
-        if (byte & 0x80) == 0 {
-            break;
-        }
-        
-        shift += 7;
-        
-        // 安全のため制限
-        if bytes_read >= 10 {
-            break;
-        }
+
+// DWARF省略形エントリ構造体
+#[derive(Debug, Clone)]
+pub struct AbbrevEntry {
+    pub code: u64,
+    pub tag: u64,
+    pub has_children: bool,
+    pub attributes: Vec<(u64, u64)>, // (attr_name, attr_form)
+}
+
+
+/// __debug_abbrevセクションからabbrevテーブルをパースし、abbrev_code→AbbrevEntryのマップを返す
+fn parse_abbrev_table(buffer: &[u8], section: &SectionInfo, abbrev_offset: u32) -> HashMap<u64, AbbrevEntry> {
+    let start_offset = section.offset as usize + abbrev_offset as usize;
+    let section_size = section.size as usize;
+    let mut abbrev_map = HashMap::new();
+    if start_offset >= buffer.len() || section_size == 0 {
+        return abbrev_map;
     }
-    
-    (result, bytes_read)
-}
-
-// __debug_abbrevセクションを検索して省略形テーブルを解析する関数
-fn find_abbrev_section_and_parse(_buffer: &[u8], _abbrev_offset: u32) -> Vec<()> {
-    // 簡易実装：バッファ全体から__debug_abbrevセクションを検索
-    // 実際の実装では、abbrev_offsetを使用してより正確に検索する必要がある
-    
-    // 簡易的に、既知の__debug_abbrevセクション情報を使用
-    // より正確な実装のためには、セクション情報を引数として渡す必要がある
-    Vec::new() // 暫定的に空のベクターを返す
-}
-
-
-
-// DWARF属性定数をDW_AT_名に変換する関数
-fn dwarf_attr_to_string(attr: u64) -> String {
-    match attr {
-        0x01 => "DW_AT_sibling".to_string(),
-        0x02 => "DW_AT_location".to_string(),
-        0x03 => "DW_AT_name".to_string(),
-        0x09 => "DW_AT_ordering".to_string(),
-        0x0b => "DW_AT_byte_size".to_string(),
-        0x0c => "DW_AT_bit_offset".to_string(),
-        0x0d => "DW_AT_bit_size".to_string(),
-        0x10 => "DW_AT_stmt_list".to_string(),
-        0x11 => "DW_AT_low_pc".to_string(),
-        0x12 => "DW_AT_high_pc".to_string(),
-        0x13 => "DW_AT_language".to_string(),
-        0x15 => "DW_AT_discr".to_string(),
-        0x16 => "DW_AT_discr_value".to_string(),
-        0x17 => "DW_AT_visibility".to_string(),
-        0x18 => "DW_AT_import".to_string(),
-        0x19 => "DW_AT_string_length".to_string(),
-        0x1a => "DW_AT_common_reference".to_string(),
-        0x1b => "DW_AT_comp_dir".to_string(),
-        0x1c => "DW_AT_const_value".to_string(),
-        0x1d => "DW_AT_containing_type".to_string(),
-        0x1e => "DW_AT_default_value".to_string(),
-        0x20 => "DW_AT_inline".to_string(),
-        0x21 => "DW_AT_is_optional".to_string(),
-        0x22 => "DW_AT_lower_bound".to_string(),
-        0x25 => "DW_AT_producer".to_string(),
-        0x27 => "DW_AT_prototyped".to_string(),
-        0x2a => "DW_AT_return_addr".to_string(),
-        0x2c => "DW_AT_start_scope".to_string(),
-        0x2e => "DW_AT_bit_stride".to_string(),
-        0x2f => "DW_AT_upper_bound".to_string(),
-        0x31 => "DW_AT_abstract_origin".to_string(),
-        0x32 => "DW_AT_accessibility".to_string(),
-        0x33 => "DW_AT_address_class".to_string(),
-        0x34 => "DW_AT_artificial".to_string(),
-        0x35 => "DW_AT_base_types".to_string(),
-        0x36 => "DW_AT_calling_convention".to_string(),
-        0x37 => "DW_AT_count".to_string(),
-        0x38 => "DW_AT_data_member_location".to_string(),
-        0x39 => "DW_AT_decl_column".to_string(),
-        0x3a => "DW_AT_decl_file".to_string(),
-        0x3b => "DW_AT_decl_line".to_string(),
-        0x3c => "DW_AT_declaration".to_string(),
-        0x3d => "DW_AT_discr_list".to_string(),
-        0x3e => "DW_AT_encoding".to_string(),
-        0x3f => "DW_AT_external".to_string(),
-        0x40 => "DW_AT_frame_base".to_string(),
-        0x41 => "DW_AT_friend".to_string(),
-        0x42 => "DW_AT_identifier_case".to_string(),
-        0x43 => "DW_AT_macro_info".to_string(),
-        0x44 => "DW_AT_namelist_item".to_string(),
-        0x45 => "DW_AT_priority".to_string(),
-        0x46 => "DW_AT_segment".to_string(),
-        0x47 => "DW_AT_specification".to_string(),
-        0x48 => "DW_AT_static_link".to_string(),
-        0x49 => "DW_AT_type".to_string(),
-        0x4a => "DW_AT_use_location".to_string(),
-        0x4b => "DW_AT_variable_parameter".to_string(),
-        0x4c => "DW_AT_virtuality".to_string(),
-        0x4d => "DW_AT_vtable_elem_location".to_string(),
-        // DWARF 3 attributes
-        0x4e => "DW_AT_allocated".to_string(),
-        0x4f => "DW_AT_associated".to_string(),
-        0x50 => "DW_AT_data_location".to_string(),
-        0x51 => "DW_AT_byte_stride".to_string(),
-        0x52 => "DW_AT_entry_pc".to_string(),
-        0x53 => "DW_AT_use_UTF8".to_string(),
-        0x54 => "DW_AT_extension".to_string(),
-        0x55 => "DW_AT_ranges".to_string(),
-        0x56 => "DW_AT_trampoline".to_string(),
-        0x57 => "DW_AT_call_column".to_string(),
-        0x58 => "DW_AT_call_file".to_string(),
-        0x59 => "DW_AT_call_line".to_string(),
-        0x5a => "DW_AT_description".to_string(),
-        0x5b => "DW_AT_binary_scale".to_string(),
-        0x5c => "DW_AT_decimal_scale".to_string(),
-        0x5d => "DW_AT_small".to_string(),
-        0x5e => "DW_AT_decimal_sign".to_string(),
-        0x5f => "DW_AT_digit_count".to_string(),
-        0x60 => "DW_AT_picture_string".to_string(),
-        0x61 => "DW_AT_mutable".to_string(),
-        0x62 => "DW_AT_threads_scaled".to_string(),
-        0x63 => "DW_AT_explicit".to_string(),
-        0x64 => "DW_AT_object_pointer".to_string(),
-        0x65 => "DW_AT_endianity".to_string(),
-        0x66 => "DW_AT_elemental".to_string(),
-        0x67 => "DW_AT_pure".to_string(),
-        0x68 => "DW_AT_recursive".to_string(),
-        // DWARF 4 attributes
-        0x69 => "DW_AT_signature".to_string(),
-        0x6a => "DW_AT_main_subprogram".to_string(),
-        0x6b => "DW_AT_data_bit_offset".to_string(),
-        0x6c => "DW_AT_const_expr".to_string(),
-        0x6d => "DW_AT_enum_class".to_string(),
-        0x6e => "DW_AT_linkage_name".to_string(),
-        // DWARF 5 attributes
-        0x6f => "DW_AT_string_length_bit_size".to_string(),
-        0x70 => "DW_AT_string_length_byte_size".to_string(),
-        0x71 => "DW_AT_rank".to_string(),
-        0x72 => "DW_AT_str_offsets_base".to_string(),
-        0x73 => "DW_AT_addr_base".to_string(),
-        0x74 => "DW_AT_rnglists_base".to_string(),
-        0x75 => "DW_AT_dwo_name".to_string(),
-        0x76 => "DW_AT_reference".to_string(),
-        0x77 => "DW_AT_rvalue_reference".to_string(),
-        0x78 => "DW_AT_macros".to_string(),
-        0x79 => "DW_AT_call_all_calls".to_string(),
-        0x7a => "DW_AT_call_all_source_calls".to_string(),
-        0x7b => "DW_AT_call_all_tail_calls".to_string(),
-        0x7c => "DW_AT_call_return_pc".to_string(),
-        0x7d => "DW_AT_call_value".to_string(),
-        0x7e => "DW_AT_call_origin".to_string(),
-        0x7f => "DW_AT_call_parameter".to_string(),
-        0x80 => "DW_AT_call_pc".to_string(),
-        0x81 => "DW_AT_call_tail_call".to_string(),
-        0x82 => "DW_AT_call_target".to_string(),
-        0x83 => "DW_AT_call_target_clobbered".to_string(),
-        0x84 => "DW_AT_call_data_location".to_string(),
-        0x85 => "DW_AT_call_data_value".to_string(),
-        0x86 => "DW_AT_noreturn".to_string(),
-        0x87 => "DW_AT_alignment".to_string(),
-        0x88 => "DW_AT_export_symbols".to_string(),
-        0x89 => "DW_AT_deleted".to_string(),
-        0x8a => "DW_AT_defaulted".to_string(),
-        0x8b => "DW_AT_loclists_base".to_string(),
-        _ => format!("DW_AT_unknown(0x{:02x})", attr),
-    }
-}
-
-fn extract_null_terminated_string(data: &[u8]) -> (String, usize) {
-    let mut string = String::new();
+    let actual_end = std::cmp::min(section.offset as usize + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
     let mut offset = 0;
-    
-    while offset < data.len() {
-        let byte = data[offset];
-        if byte == 0 {
+    loop {
+        let (code, consumed) = read_uleb128(&section_data[offset..]);
+        offset += consumed;
+        if code == 0 {
+            // NULL entry: abbrevテーブル終端
             break;
         }
-        
-        string.push(byte as char);
+        let (tag, consumed2) = read_uleb128(&section_data[offset..]);
+        offset += consumed2;
+        let has_children = match section_data[offset] {
+            0 => false,
+            1 => true,
+            v => {
+                // 不正値
+                eprintln!("    [abbrev] 警告: has_children値が不正: {}", v);
+                false
+            }
+        };
         offset += 1;
+        let mut attributes = Vec::new();
+        loop {
+            let (attr_name, c1) = read_uleb128(&section_data[offset..]);
+            offset += c1;
+            let (attr_form, c2) = read_uleb128(&section_data[offset..]);
+            offset += c2;
+            if attr_name == 0 && attr_form == 0 {
+                break;
+            }
+            attributes.push((attr_name, attr_form));
+        }
+        abbrev_map.insert(code, AbbrevEntry {
+            code,
+            tag,
+            has_children,
+            attributes,
+        });
     }
-    
-    (string, offset + 1)
+    abbrev_map
 }
+
+fn display_die_tree(
+    section_data: &[u8],
+    offset: &mut usize,
+    abbrev_map: &std::collections::HashMap<u64, AbbrevEntry>,
+    depth: usize,
+    version: u16,
+    debug_str_buf: Option<&[u8]>,
+    debug_str_off: Option<u32>,
+    debug_str_size: Option<u32>,
+    address_size: usize,
+    macho_header: &mach_header_64,
+    text_addr: u64,
+) {
+    let (abbrev_code, consumed) = read_uleb128(&section_data[*offset..]);
+    *offset += consumed;
+    display_die_tree_recursive(section_data, abbrev_code, offset, abbrev_map, depth, version, debug_str_buf, debug_str_off, debug_str_size, address_size, macho_header, text_addr);
+}
+
+fn display_die_tree_recursive(
+    section_data: &[u8],
+    abbrev_code: u64,
+    offset: &mut usize,
+    abbrev_map: &std::collections::HashMap<u64, AbbrevEntry>,
+    depth: usize,
+    version: u16,
+    debug_str_buf: Option<&[u8]>,
+    debug_str_off: Option<u32>,
+    debug_str_size: Option<u32>,
+    address_size: usize,
+    macho_header: &mach_header_64,
+    text_addr: u64,
+) {
+    let indent = "  ".repeat(depth);
+    let die_start = *offset;
+
+    if abbrev_code == 0 {
+        println!("{}<NULL DIE>", indent);
+        return;
+    }
+    let abbrev = match abbrev_map.get(&abbrev_code) {
+        Some(a) => a,
+        None => {
+            println!("{}[未知のabbrev_code: {}]", indent, abbrev_code);
+            return;
+        }
+    };
+    
+    // タグ名を表示
+    let tag_name = get_die_tag_name(abbrev.tag, version);
+    println!("{}<{:x}><{}> {}", indent, die_start, abbrev_code, tag_name);
+    
+    let mut attr_values: Vec<(u64, u64, u8, String, String)> = Vec::new(); // (attr, value, form, attr_name_str, human_value)
+    let _attr_count = abbrev.attributes.len();
+    let mut offset_tmp = *offset;
+    let mut low_pc_opt: Option<u64> = None;
+    for (attr_name, attr_form) in &abbrev.attributes {
+        let attr_name_str = get_attr_name(*attr_name).to_string();
+        let (value, human_value, form_code) = match *attr_form {
+            0x08 => {
+                let (s, consumed) = extract_null_terminated_string(&section_data[offset_tmp..]);
+                offset_tmp += consumed;
+                (0, format!("\"{}\"", s), 0x08)
+            },
+            0x0e => {
+                let raw = &section_data[offset_tmp..offset_tmp+4];
+                let attr_value = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as u64;
+                offset_tmp += 4;
+                let value_str = if let (Some(buf), Some(stroff), Some(strsize)) = (debug_str_buf, debug_str_off, debug_str_size) {
+                    get_string_from_table(buf, stroff, strsize, attr_value as u32)
+                } else {
+                    format!("0x{:x}", attr_value)
+                };
+                (attr_value, format!("(strp: 0x{:x}) \"{}\"", attr_value, value_str), 0x0e)
+            },
+            0x0b => {
+                let value = section_data[offset_tmp] as u64;
+                offset_tmp += 1;
+                if *attr_name == 0x13 {
+                    (value, format!("0x{:x} ({} - {})", value, get_language_name(value), get_language_description(value)), 0x0b)
+                } else {
+                    (value, format!("0x{:x}", value), 0x0b)
+                }
+            },
+            0x05 => {
+                let value = u16::from_le_bytes([
+                    section_data[offset_tmp],
+                    section_data[offset_tmp+1],
+                ]) as u64;
+                offset_tmp += 2;
+                if *attr_name == 0x12 || *attr_name == 0x13 { // DW_AT_low_pc, DW_AT_high_pc
+                    let abs_addr = value + text_addr;
+                    (abs_addr, format!("0x{:x} (base: 0x{:x} + offset: 0x{:x})", abs_addr, text_addr, value), 0x05)
+                } else if *attr_name == 0x11 { // DW_AT_low_pc
+                    (value, format!("0x{:x}", value), 0x05)
+                } else {
+                    (value, format!("0x{:x}", value), 0x05)
+                }
+            },
+            0x06 | 0x13 => {
+                let value = u32::from_le_bytes([
+                    section_data[offset_tmp],
+                    section_data[offset_tmp+1],
+                    section_data[offset_tmp+2],
+                    section_data[offset_tmp+3],
+                ]) as u64;
+                offset_tmp += 4;
+                if *attr_name == 0x12 || *attr_name == 0x13 { // DW_AT_low_pc, DW_AT_high_pc
+                    let abs_addr = value + text_addr;
+                    (abs_addr, format!("0x{:x} (base: 0x{:x} + offset: 0x{:x})", abs_addr, text_addr, value), if *attr_form == 0x06 { 0x06 } else { 0x13 })
+                } else if *attr_name == 0x11 { // DW_AT_low_pc
+                    (value, format!("0x{:x}", value), if *attr_form == 0x06 { 0x06 } else { 0x13 })
+                } else {
+                    (value, format!("0x{:x}", value), if *attr_form == 0x06 { 0x06 } else { 0x13 })
+                }
+            },
+            0x07 => {
+                if *attr_name == 0x12 || *attr_name == 0x13 {
+                    let value = if address_size == 8 {
+                        u64::from_le_bytes([
+                            section_data[offset_tmp],
+                            section_data[offset_tmp+1],
+                            section_data[offset_tmp+2],
+                            section_data[offset_tmp+3],
+                            section_data[offset_tmp+4],
+                            section_data[offset_tmp+5],
+                            section_data[offset_tmp+6],
+                            section_data[offset_tmp+7],
+                        ])
+                    } else {
+                        u32::from_le_bytes([
+                            section_data[offset_tmp],
+                            section_data[offset_tmp+1],
+                            section_data[offset_tmp+2],
+                            section_data[offset_tmp+3],
+                        ]) as u64
+                    };
+                    let abs_addr = value + text_addr;
+                    offset_tmp += address_size;
+                    (abs_addr, format!("0x{:x} (base: 0x{:x} + offset: 0x{:x})", abs_addr, text_addr, value), 0x07)
+                } else {
+                    let value = u64::from_le_bytes([
+                        section_data[offset_tmp],
+                        section_data[offset_tmp+1],
+                        section_data[offset_tmp+2],
+                        section_data[offset_tmp+3],
+                        section_data[offset_tmp+4],
+                        section_data[offset_tmp+5],
+                        section_data[offset_tmp+6],
+                        section_data[offset_tmp+7],
+                    ]);
+                    offset_tmp += 8;
+                    (value, format!("0x{:x}", value), 0x07)
+                }
+            },
+            _ => {
+                let (attr_value, consumed) = read_uleb128(&section_data[offset_tmp..]);
+                offset_tmp += consumed;
+                if *attr_name == 0x12 || *attr_name == 0x13 { // DW_AT_low_pc, DW_AT_high_pc
+                    let abs_addr = attr_value + text_addr;
+                    (abs_addr, format!("0x{:x} (base: 0x{:x} + offset: 0x{:x})", abs_addr, text_addr, attr_value), 0xff)
+                } else if *attr_name == 0x11 { // DW_AT_low_pc
+                    (attr_value, format!("0x{:x}", attr_value), 0xff)
+                } else if *attr_name == 0x14 { // DW_AT_language
+                    (attr_value, format!("0x{:x} ({} - {})", attr_value, get_language_name(attr_value), get_language_description(attr_value)), 0xff)
+                } else {
+                    (attr_value, format!("0x{:x}", attr_value), 0xff)
+                }
+            },
+        };
+        if *attr_name == 0x12 { // DW_AT_low_pc
+            low_pc_opt = Some(value); // valueは既に仮想ベースアドレスが加算済み
+        }
+        attr_values.push((*attr_name, value, form_code, attr_name_str, human_value));
+    }
+    *offset = offset_tmp;
+    // 2回目: 出力
+    for (attr_name, value, attr_form, attr_name_str, human_value) in &attr_values {
+        if *attr_name == 0x13 { // DW_AT_high_pc
+            if let Some(low_pc) = low_pc_opt {
+                // DW_FORM_addr (0x01, 0x05, 0x06, 0x07, 0x13) の場合は value が絶対アドレス、それ以外は low_pc からのオフセット
+                let end_addr = if *attr_form == 0x01 || *attr_form == 0x05 || *attr_form == 0x06 || *attr_form == 0x07 || *attr_form == 0x13 {
+                    *value // valueは既に仮想ベースアドレスが加算済み
+                } else {
+                    low_pc + *value
+                };
+                println!("{}  {}\t({} → 終了アドレス: 0x{:x})", indent, attr_name_str, human_value, end_addr);
+                continue;
+            }
+        }
+        println!("{}  {}\t({})", indent, attr_name_str, human_value);
+    }
+
+
+
+    if abbrev.has_children {
+        loop {
+            let (abbrev_code, consumed) = read_uleb128(&section_data[*offset..]);
+            if abbrev_code == 0 {
+                *offset += consumed; // NULL DIEなので消費バイト数分オフセットを進める
+                break; // end of children
+            }
+            *offset += consumed; // abbrev_codeを読み飛ばす
+            display_die_tree_recursive(section_data, abbrev_code, offset, abbrev_map, depth + 1, version, debug_str_buf, debug_str_off, debug_str_size, address_size, macho_header, text_addr);
+        }
+    }
+}
+
+
+
 
 // DWARFバージョンを抽出する関数
 fn extract_dwarf_version(buffer: &[u8], section: &SectionInfo) -> Option<u16> {
@@ -2723,255 +3294,39 @@ fn extract_dwarf_version(buffer: &[u8], section: &SectionInfo) -> Option<u16> {
     Some(version)
 }
 
-fn display_debug_info_detailed(buffer: &[u8], debug_info: &DebugInfo) {
-    println!("\n\n=== DWARFセクション詳細解析 ===");
-    
-    // DWARFバージョンを取得（__debug_infoセクションから）
-    let mut dwarf_version = 4; // デフォルト値
-    if let Some(debug_info_section) = debug_info.dwarf_sections.iter().find(|s| s.name == "__debug_info") {
-        if let Some(version) = extract_dwarf_version(buffer, debug_info_section) {
-            dwarf_version = version;
-        }
-    }
-    
-    println!("    検出されたDWARFバージョン: {}", dwarf_version);
-    
-    for (index, section) in debug_info.dwarf_sections.iter().enumerate() {
-        println!("\n[{:2}] {} 詳細解析", index + 1, section.name);
-        println!("    アドレス: 0x{:016x}", section.addr);
-        println!("    サイズ: {} バイト", section.size);
-        println!("    オフセット: 0x{:08x}", section.offset);
-        
-        match section.name.as_str() {
-            "__debug_line" => {
-                parse_and_display_debug_line(buffer, section);
-            },
-            "__debug_info" => {
-                parse_and_display_debug_info(buffer, section);
-            },
-            "__debug_str" => {
-                parse_and_display_debug_str(buffer, section);
-            },
-            "__debug_abbrev" => {
-                parse_and_display_debug_abbrev(buffer, section, dwarf_version);
-            },
-            "__debug_aranges" => {
-                parse_and_display_debug_aranges(buffer, section);
-            },
-            "__debug_ranges" => {
-                parse_and_display_debug_ranges(buffer, section);
-            },
-            "__debug_loc" => {
-                parse_and_display_debug_loc(buffer, section);
-            },
-            "__debug_pubnames" => {
-                parse_and_display_debug_pubnames(buffer, section);
-            },
-            "__debug_pubtypes" => {
-                parse_and_display_debug_pubtypes(buffer, section);
-            },
-            "__debug_frame" => {
-                parse_and_display_debug_frame(buffer, section);
-            },
-            "__eh_frame" => {
-                parse_and_display_eh_frame(buffer, section);
-            },
-            "__debug_line_str" => {
-                parse_and_display_debug_line_str(buffer, section);
-            },
-            _ => {
-                // その他のセクションは基本情報のみ表示
-            }
-        }
-    }
-}
-
-fn parse_and_display_debug_line(buffer: &[u8], section: &SectionInfo) {
-    let start_offset = section.offset as usize;
-    let section_size = section.size as usize;
-    
-    if start_offset >= buffer.len() || section_size == 0 {
-        println!("    エラー: __debug_lineセクションのデータが無効です");
-        return;
-    }
-    
-    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
-    let section_data = &buffer[start_offset..actual_end];
-    
-    if section_data.len() < 12 {
-        println!("    エラー: __debug_lineセクションが小さすぎます");
-        return;
-    }
-    
-    println!("    === __debug_line 詳細解析 ===");
-    
-    // DWARFヘッダーを解析
-    let unit_length = u32::from_le_bytes([
-        section_data[0], section_data[1], section_data[2], section_data[3]
-    ]);
-    let version = u16::from_le_bytes([
-        section_data[4], section_data[5]
-    ]);
-    
-    println!("    DWARF バージョン: {}", version);
-    println!("    ユニット長: {} バイト", unit_length);
-    
-    if version < 2 || version > 5 {
-        println!("    警告: サポートされていないDWARFバージョンです");
-        return;
-    }
-    
-    // DWARF5ではヘッダー構造が異なる
-    let (header_length, min_inst_length, max_ops_per_inst, default_is_stmt, line_base, line_range, opcode_base, mut offset) = 
-        if version >= 5 {
-            // DWARF5形式
-            if section_data.len() < 18 {
-                println!("    エラー: DWARF5ヘッダーが不完全です");
-                return;
-            }
-            let addr_size = section_data[6];
-            let seg_size = section_data[7];
-            let header_length = u32::from_le_bytes([
-                section_data[8], section_data[9], section_data[10], section_data[11]
-            ]);
-            let min_inst_length = section_data[12];
-            let max_ops_per_inst = section_data[13];
-            let default_is_stmt = section_data[14];
-            let line_base = section_data[15] as i8;
-            let line_range = section_data[16];
-            let opcode_base = section_data[17];
-            
-            println!("    アドレスサイズ: {} バイト", addr_size);
-            println!("    セグメントサイズ: {} バイト", seg_size);
-            
-            (header_length, min_inst_length, max_ops_per_inst, default_is_stmt, line_base, line_range, opcode_base, 18)
-        } else if version >= 4 {
-            // DWARF4形式
-            if section_data.len() < 16 {
-                println!("    エラー: DWARF4ヘッダーが不完全です");
-                return;
-            }
-            let header_length = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let min_inst_length = section_data[10];
-            let max_ops_per_inst = section_data[11];
-            let default_is_stmt = section_data[12];
-            let line_base = section_data[13] as i8;
-            let line_range = section_data[14];
-            let opcode_base = section_data[15];
-            
-            (header_length, min_inst_length, max_ops_per_inst, default_is_stmt, line_base, line_range, opcode_base, 16)
-        } else {
-            // DWARF2-3形式
-            if section_data.len() < 15 {
-                println!("    エラー: DWARF2-3ヘッダーが不完全です");
-                return;
-            }
-            let header_length = u32::from_le_bytes([
-                section_data[6], section_data[7], section_data[8], section_data[9]
-            ]);
-            let min_inst_length = section_data[10];
-            let max_ops_per_inst = 1;
-            let default_is_stmt = section_data[11];
-            let line_base = section_data[12] as i8;
-            let line_range = section_data[13];
-            let opcode_base = section_data[14];
-            
-            (header_length, min_inst_length, max_ops_per_inst, default_is_stmt, line_base, line_range, opcode_base, 15)
-        };
-    
-    println!("    ヘッダー長: {} バイト", header_length);
-    println!("    最小命令長: {} バイト", min_inst_length);
-    if version >= 4 {
-        println!("    命令あたり最大操作数: {}", max_ops_per_inst);
-    }
-    println!("    デフォルトis_stmt: {}", default_is_stmt);
-    println!("    行ベース: {}", line_base);
-    println!("    行範囲: {}", line_range);
-    println!("    オペコードベース: {}", opcode_base);
-    
-    // 標準オペコード長テーブルを読み取り
-    // offsetは既にヘッダー解析で正しく設定されている
-    println!("\n    --- 標準オペコード長テーブル ---");
-    for i in 1..opcode_base {
-        if offset >= section_data.len() {
-            break;
-        }
-        let length = section_data[offset];
-        println!("    オペコード {}: {} 引数", i, length);
-        offset += 1;
-    }
-    
-    // DWARF5とそれ以前でファイル名テーブルの形式が異なる
-    println!("\n    --- ファイル名テーブル解析開始 ---");
-    println!("    現在のオフセット: 0x{:04x}", offset);
-    println!("    残りデータサイズ: {} バイト", section_data.len() - offset);
-    
-    let (directories, file_names) = if version >= 5 {
-        println!("    DWARF5形式で解析中...");
-        parse_dwarf5_file_table(&section_data[offset..], &mut offset)
-    } else {
-        println!("    DWARF2-4形式で解析中...");
-        parse_dwarf2_4_file_table(&section_data[offset..], &mut offset)
-    };
-    
-    // インクルードディレクトリテーブル
-    println!("\n    --- インクルードディレクトリ ---");
-    if directories.is_empty() {
-        if version >= 5 {
-            println!("    注意: DWARF5では、ディレクトリ情報は__debug_line_strセクションに格納されています");
-            println!("    1: /Users/tsu/src/rust/tsudump (from __debug_line_str)");
-        } else {
-            println!("    (なし)");
-        }
-    } else {
-        for (i, dir) in directories.iter().enumerate() {
-            println!("    {:2}: {}", i + 1, dir);
-        }
-    }
-    
-    // ファイル名テーブル
-    println!("\n    --- ファイル名テーブル ---");
-    if file_names.is_empty() {
-        if version >= 5 {
-            println!("    注意: DWARF5では、ファイル名情報は__debug_line_strセクションに格納されています");
-            println!("    1: a.c (from __debug_line_str)");
-        } else {
-            println!("    (なし)");
-        }
-    } else {
-        for (i, file) in file_names.iter().enumerate() {
-            println!("    {:2}: {}", i + 1, file);
-        }
-    }
-    
-    // ライン番号プログラムの解析
-    println!("\n    --- ライン番号プログラム解析 ---");
-    println!("    プログラム開始オフセット: 0x{:04x}", offset);
-    let remaining_bytes = section_data.len() - offset;
-    println!("    プログラムサイズ: {} バイト", remaining_bytes);
-    
-    if remaining_bytes > 0 {
-        parse_line_number_program(&section_data[offset..], &file_names, line_base, line_range, opcode_base);
-    }
-}
-
 fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_base: i8, line_range: u8, opcode_base: u8) {
-    println!("    ライン番号マシン状態変化 (最初の20エントリ):");
+    println!("Address            Line   Column File   ISA Discriminator OpIndex Flags");
+    println!("------------------ ------ ------ ------ --- ------------- ------- -------------");
     
     let mut offset = 0;
     let mut address = 0u64;
     let mut file_index = 1u32;
     let mut line = 1u32;
-    let mut _column = 0u32;
+    let mut column = 0u32;
     let mut is_stmt = true;
     let mut basic_block = false;
-    let mut _end_sequence = false;
-    let mut entry_count = 0;
-    let max_entries = 20;
+    let mut end_sequence = false;
+    let mut prologue_end = false;
+    let mut epilogue_begin = false;
+    let mut isa = 0u32;
+    let mut discriminator = 0u32;
+    let mut op_index = 0u32;
     
-    while offset < program_data.len() && entry_count < max_entries {
+    // 行情報を出力するヘルパー関数
+    let mut output_row = |addr: u64, ln: u32, col: u32, file_idx: u32, isa_val: u32, disc: u32, op_idx: u32,
+                         stmt: bool, bb: bool, end_seq: bool, prol_end: bool, epil_begin: bool| {
+        let mut flags = Vec::new();
+        if stmt { flags.push("is_stmt"); }
+        if bb { flags.push("basic_block"); }
+        if end_seq { flags.push("end_sequence"); }
+        if prol_end { flags.push("prologue_end"); }
+        if epil_begin { flags.push("epilogue_begin"); }
+        
+        println!("0x{:016x} {:6} {:6} {:6} {:3} {:13} {:7} {}",
+                addr, ln, col, file_idx, isa_val, disc, op_idx, flags.join(" "));
+    };
+    
+    while offset < program_data.len() {
         let opcode = program_data[offset];
         offset += 1;
         
@@ -2992,19 +3347,22 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
             match ext_opcode {
                 1 => {
                     // DW_LNE_end_sequence
-                    _end_sequence = true;
-                    println!("      {:2}: [0x{:08x}] {}:{} - シーケンス終了", 
-                             entry_count + 1, address, 
-                             file_names.get((file_index - 1) as usize).unwrap_or(&"?".to_string()), 
-                             line);
+                    end_sequence = true;
+                    output_row(address, line, column, file_index, isa, discriminator, op_index,
+                              is_stmt, basic_block, end_sequence, prologue_end, epilogue_begin);
                     // 状態をリセット
                     address = 0;
                     file_index = 1;
                     line = 1;
-                    _column = 0;
+                    column = 0;
                     is_stmt = true;
                     basic_block = false;
-                    _end_sequence = false;
+                    end_sequence = false;
+                    prologue_end = false;
+                    epilogue_begin = false;
+                    isa = 0;
+                    discriminator = 0;
+                    op_index = 0;
                 },
                 2 => {
                     // DW_LNE_set_address
@@ -3016,18 +3374,24 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
                             program_data[offset + 6], program_data[offset + 7]
                         ]);
                         offset += 8;
-                        println!("      {:2}: アドレス設定 -> 0x{:08x}", entry_count + 1, address);
                     }
                 },
                 3 => {
                     // DW_LNE_define_file
-                    let (filename, consumed) = extract_null_terminated_string(&program_data[offset..]);
+                    let (_filename, consumed) = extract_null_terminated_string(&program_data[offset..]);
                     offset += consumed;
-                    println!("      {:2}: ファイル定義 -> {}", entry_count + 1, filename);
+                    // ディレクトリインデックス、修正時刻、ファイルサイズをスキップ
+                    let (_, consumed) = read_uleb128(&program_data[offset..]);
+                    offset += consumed;
+                    let (_, consumed) = read_uleb128(&program_data[offset..]);
+                    offset += consumed;
+                    let (_, consumed) = read_uleb128(&program_data[offset..]);
+                    offset += consumed;
                 },
                 _ => {
-                    println!("      {:2}: 未知の拡張オペコード {}", entry_count + 1, ext_opcode);
-                    offset += (length - 1) as usize;
+                    if length > 1 {
+                        offset += (length - 1) as usize;
+                    }
                 }
             }
         } else if opcode < opcode_base {
@@ -3035,60 +3399,49 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
             match opcode {
                 1 => {
                     // DW_LNS_copy
-                    println!("      {:2}: [0x{:08x}] {}:{} - コピー{}{}", 
-                             entry_count + 1, address,
-                             file_names.get((file_index - 1) as usize).unwrap_or(&"?".to_string()),
-                             line,
-                             if is_stmt { " (stmt)" } else { "" },
-                             if basic_block { " (bb)" } else { "" });
+                    output_row(address, line, column, file_index, isa, discriminator, op_index,
+                              is_stmt, basic_block, end_sequence, prologue_end, epilogue_begin);
                     basic_block = false;
+                    prologue_end = false;
+                    epilogue_begin = false;
                 },
                 2 => {
                     // DW_LNS_advance_pc
                     let (advance, consumed) = read_uleb128(&program_data[offset..]);
                     offset += consumed;
                     address += advance;
-                    println!("      {:2}: PC進行 +{} -> 0x{:08x}", entry_count + 1, advance, address);
                 },
                 3 => {
                     // DW_LNS_advance_line
                     let (advance, consumed) = read_sleb128(&program_data[offset..]);
                     offset += consumed;
                     line = (line as i64 + advance) as u32;
-                    println!("      {:2}: 行進行 {} -> {}", entry_count + 1, advance, line);
                 },
                 4 => {
                     // DW_LNS_set_file
                     let (new_file, consumed) = read_uleb128(&program_data[offset..]);
                     offset += consumed;
                     file_index = new_file as u32;
-                    println!("      {:2}: ファイル設定 -> {} ({})", 
-                             entry_count + 1, file_index,
-                             file_names.get((file_index - 1) as usize).unwrap_or(&"?".to_string()));
                 },
                 5 => {
                     // DW_LNS_set_column
                     let (new_column, consumed) = read_uleb128(&program_data[offset..]);
                     offset += consumed;
-                    _column = new_column as u32;
-                    println!("      {:2}: 列設定 -> {}", entry_count + 1, _column);
+                    column = new_column as u32;
                 },
                 6 => {
                     // DW_LNS_negate_stmt
                     is_stmt = !is_stmt;
-                    println!("      {:2}: stmt反転 -> {}", entry_count + 1, is_stmt);
                 },
                 7 => {
                     // DW_LNS_set_basic_block
                     basic_block = true;
-                    println!("      {:2}: 基本ブロック設定", entry_count + 1);
                 },
                 8 => {
                     // DW_LNS_const_add_pc
                     let adjusted_opcode = 255 - opcode_base;
                     let addr_advance = (adjusted_opcode / line_range) as u64;
                     address += addr_advance;
-                    println!("      {:2}: 定数PC加算 +{} -> 0x{:08x}", entry_count + 1, addr_advance, address);
                 },
                 9 => {
                     // DW_LNS_fixed_advance_pc
@@ -3096,11 +3449,24 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
                         let advance = u16::from_le_bytes([program_data[offset], program_data[offset + 1]]);
                         offset += 2;
                         address += advance as u64;
-                        println!("      {:2}: 固定PC進行 +{} -> 0x{:08x}", entry_count + 1, advance, address);
                     }
                 },
+                10 => {
+                    // DW_LNS_set_prologue_end
+                    prologue_end = true;
+                },
+                11 => {
+                    // DW_LNS_set_epilogue_begin
+                    epilogue_begin = true;
+                },
+                12 => {
+                    // DW_LNS_set_isa
+                    let (new_isa, consumed) = read_uleb128(&program_data[offset..]);
+                    offset += consumed;
+                    isa = new_isa as u32;
+                },
                 _ => {
-                    println!("      {:2}: 未知の標準オペコード {}", entry_count + 1, opcode);
+                    // 未知の標準オペコード - パラメータをスキップ
                 }
             }
         } else {
@@ -3112,20 +3478,12 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
             address += addr_advance;
             line = (line as i64 + line_advance as i64) as u32;
             
-            println!("      {:2}: [0x{:08x}] {}:{} - 特別オペコード{}{}", 
-                     entry_count + 1, address,
-                     file_names.get((file_index - 1) as usize).unwrap_or(&"?".to_string()),
-                     line,
-                     if is_stmt { " (stmt)" } else { "" },
-                     if basic_block { " (bb)" } else { "" });
+            output_row(address, line, column, file_index, isa, discriminator, op_index,
+                      is_stmt, basic_block, end_sequence, prologue_end, epilogue_begin);
             basic_block = false;
+            prologue_end = false;
+            epilogue_begin = false;
         }
-        
-        entry_count += 1;
-    }
-    
-    if offset < program_data.len() {
-        println!("    ... (残り{}バイトのプログラムデータ)", program_data.len() - offset);
     }
 }
 
@@ -3164,94 +3522,39 @@ fn read_sleb128(data: &[u8]) -> (i64, usize) {
     (result, bytes_read)
 }
 
-// DWARF5形式のファイル名テーブル解析
-fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec<String>) {
-    let mut directories = Vec::new();
-    let mut file_names = Vec::new();
-    
-    println!("      DWARF5ファイルテーブル解析開始: オフセット=0x{:04x}, データサイズ={}", *offset, data.len());
-    
-    if *offset >= data.len() {
-        println!("      エラー: オフセットがデータサイズを超えています");
-        return (directories, file_names);
-    }
-    
-    // DWARF5では、ディレクトリエントリフォーマット数を読み取り
-    if *offset >= data.len() {
-        println!("      エラー: ディレクトリエントリフォーマット数読み取り時にオフセットが範囲外");
-        return (directories, file_names);
-    }
-    let directory_entry_format_count = data[*offset];
-    println!("      ディレクトリエントリフォーマット数: {}", directory_entry_format_count);
-    *offset += 1;
-    
-    // ディレクトリエントリフォーマットをスキップ（簡略化）
-    for _ in 0..directory_entry_format_count {
-        if *offset + 1 >= data.len() {
-            return (directories, file_names);
+// gimli::AttributeValue から安全にStringを取得するヘルパ関数（gimli 0.28.x対応）
+fn attr_value_to_string<'a, R: gimli::Reader<Offset = usize>>(
+    attr: &gimli::AttributeValue<R>,
+    debug_str: &gimli::DebugStr<R>,
+) -> String {
+    match attr {
+        gimli::AttributeValue::String(s) => {
+            match s.to_slice() {
+                Ok(slice) => std::str::from_utf8(&slice).unwrap_or("<invalid utf8>").to_string(),
+                Err(_) => "<invalid slice>".to_string(),
+            }
         }
-        let (_content_type, consumed) = read_uleb128(&data[*offset..]);
-        *offset += consumed;
-        let (_form, consumed) = read_uleb128(&data[*offset..]);
-        *offset += consumed;
-    }
-    
-    // ディレクトリ数を読み取り
-    if *offset >= data.len() {
-        return (directories, file_names);
-    }
-    let (directories_count, consumed) = read_uleb128(&data[*offset..]);
-    *offset += consumed;
-    
-    // ディレクトリエントリを読み取り（簡略化：文字列のみ）
-    for _ in 0..directories_count {
-        if *offset >= data.len() {
-            break;
+        gimli::AttributeValue::DebugStrRef(str_ref) => {
+            match debug_str.get_str(*str_ref) {
+                Ok(entry) => {
+                    match entry.to_slice() {
+                        Ok(slice) => std::str::from_utf8(&slice).unwrap_or("<invalid utf8>").to_string(),
+                        Err(_) => "<invalid slice>".to_string(),
+                    }
+                },
+                Err(_) => "<invalid debug_str>".to_string(),
+            }
         }
-        let (dir_name, consumed) = extract_null_terminated_string(&data[*offset..]);
-        directories.push(dir_name);
-        *offset += consumed;
-    }
-    
-    // ファイル名エントリフォーマット数を読み取り
-    if *offset >= data.len() {
-        return (directories, file_names);
-    }
-    let file_name_entry_format_count = data[*offset];
-    *offset += 1;
-    
-    // ファイル名エントリフォーマットをスキップ（簡略化）
-    for _ in 0..file_name_entry_format_count {
-        if *offset + 1 >= data.len() {
-            return (directories, file_names);
+        gimli::AttributeValue::DebugLineStrRef(str_ref) => {
+            // DebugLineStrRef対応が必要ならここに追加
+            "<DebugLineStrRef未対応>".to_string()
         }
-        let (_content_type, consumed) = read_uleb128(&data[*offset..]);
-        *offset += consumed;
-        let (_form, consumed) = read_uleb128(&data[*offset..]);
-        *offset += consumed;
+        _ => "<非対応AttributeValue>".to_string(),
     }
-    
-    // ファイル名数を読み取り
-    if *offset >= data.len() {
-        return (directories, file_names);
-    }
-    let (file_names_count, consumed) = read_uleb128(&data[*offset..]);
-    *offset += consumed;
-    
-    // ファイル名エントリを読み取り（簡略化：文字列のみ）
-    for _ in 0..file_names_count {
-        if *offset >= data.len() {
-            break;
-        }
-        let (file_name, consumed) = extract_null_terminated_string(&data[*offset..]);
-        file_names.push(file_name);
-        *offset += consumed;
-    }
-    
-    (directories, file_names)
 }
 
-// DWARF2-4形式のファイル名テーブル解析
+// __debug_line詳細: アドレス→ファイル名:行番号 テーブル出力（gimli利用）
+
 fn parse_dwarf2_4_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec<String>) {
     let mut directories = Vec::new();
     let mut file_names = Vec::new();
@@ -3295,6 +3598,249 @@ fn parse_dwarf2_4_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, V
     // ファイル名テーブル終了のヌルバイトをスキップ
     if *offset < data.len() && data[*offset] == 0 {
         *offset += 1;
+    }
+    
+    (directories, file_names)
+}
+
+// DWARF 5の__debug_str_offsetsセクションを解析
+fn parse_and_display_debug_str_offsets(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __debug_str_offsets 詳細解析 ===");
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __debug_str_offsetsセクションのデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    println!("セクションサイズ: {} バイト", section_data.len());
+    
+    // DWARF 5の文字列オフセットテーブルを解析
+    let mut offset = 0;
+    let mut entry_count = 0;
+    
+    println!("\n--- 文字列オフセットエントリ ---");
+    
+    while offset + 4 <= section_data.len() && entry_count < 20 {
+        let str_offset = u32::from_le_bytes([
+            section_data[offset], section_data[offset + 1],
+            section_data[offset + 2], section_data[offset + 3]
+        ]);
+        
+        println!("  {}: 0x{:08x}", entry_count, str_offset);
+        
+        offset += 4;
+        entry_count += 1;
+    }
+    
+    if entry_count == 0 {
+        println!("  (エントリが見つかりませんでした)");
+    } else if entry_count == 20 && offset < section_data.len() {
+        println!("  ... (残りのエントリは省略)");
+    }
+}
+
+// DWARF 5の__debug_addrセクションを解析
+fn parse_and_display_debug_addr(buffer: &[u8], section: &SectionInfo) {
+    println!("\n=== __debug_addr 詳細解析 ===");
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("エラー: __debug_addrセクションのデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    println!("セクションサイズ: {} バイト", section_data.len());
+    
+    // DWARF 5のアドレステーブルヘッダーを解析
+    if section_data.len() < 8 {
+        println!("エラー: セクションが小さすぎます");
+        return;
+    }
+    
+    let unit_length = u32::from_le_bytes([
+        section_data[0], section_data[1], section_data[2], section_data[3]
+    ]);
+    let version = u16::from_le_bytes([
+        section_data[4], section_data[5]
+    ]);
+    let address_size = section_data[6];
+    let segment_selector_size = section_data[7];
+    
+    println!("ユニット長: {} バイト", unit_length);
+    println!("バージョン: {}", version);
+    println!("アドレスサイズ: {} バイト", address_size);
+    println!("セグメントセレクタサイズ: {} バイト", segment_selector_size);
+    
+    // アドレスエントリを解析
+    let mut offset = 8;
+    let mut entry_count = 0;
+    
+    println!("\n--- アドレスエントリ ---");
+    
+    while offset + address_size as usize <= section_data.len() && entry_count < 20 {
+        let address = if address_size == 8 {
+            u64::from_le_bytes([
+                section_data[offset], section_data[offset + 1],
+                section_data[offset + 2], section_data[offset + 3],
+                section_data[offset + 4], section_data[offset + 5],
+                section_data[offset + 6], section_data[offset + 7]
+            ])
+        } else if address_size == 4 {
+            u32::from_le_bytes([
+                section_data[offset], section_data[offset + 1],
+                section_data[offset + 2], section_data[offset + 3]
+            ]) as u64
+        } else {
+            println!("  エラー: サポートされていないアドレスサイズ: {}", address_size);
+            break;
+        };
+        
+        println!("  {}: 0x{:016x}", entry_count, address);
+        
+        offset += address_size as usize;
+        entry_count += 1;
+    }
+    
+    if entry_count == 0 {
+        println!("  (エントリが見つかりませんでした)");
+    } else if entry_count == 20 && offset < section_data.len() {
+        println!("  ... (残りのエントリは省略)");
+    }
+}
+// DWARF 5のファイルテーブル解析
+fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec<String>) {
+    let mut directories = Vec::new();
+    let mut file_names = Vec::new();
+    
+    // DWARF 5では新しいファイルテーブル形式
+    if *offset + 1 >= data.len() {
+        return (directories, file_names);
+    }
+    
+    // ディレクトリエントリフォーマット数
+    let directory_entry_format_count = data[*offset];
+    *offset += 1;
+    
+    // ディレクトリエントリフォーマット
+    let mut dir_formats = Vec::new();
+    for _ in 0..directory_entry_format_count {
+        if *offset >= data.len() {
+            break;
+        }
+        let (content_type, consumed) = read_uleb128(&data[*offset..]);
+        *offset += consumed;
+        let (form, consumed) = read_uleb128(&data[*offset..]);
+        *offset += consumed;
+        dir_formats.push((content_type, form));
+    }
+    
+    // ディレクトリ数
+    if *offset >= data.len() {
+        return (directories, file_names);
+    }
+    let (directories_count, consumed) = read_uleb128(&data[*offset..]);
+    *offset += consumed;
+    
+    // ディレクトリエントリ
+    for _ in 0..directories_count {
+        let mut dir_name = String::new();
+        for (content_type, form) in &dir_formats {
+            if *content_type == 1 { // DW_LNCT_path
+                if *form == 0x08 { // DW_FORM_string
+                    let (name, consumed) = extract_null_terminated_string(&data[*offset..]);
+                    dir_name = name;
+                    *offset += consumed;
+                } else if *form == 0x0e { // DW_FORM_strp
+                    if *offset + 4 <= data.len() {
+                        let str_offset = u32::from_le_bytes([
+                            data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+                        ]);
+                        *offset += 4;
+                        dir_name = format!("strp_offset_0x{:x}", str_offset);
+                    }
+                } else {
+                    // 他のフォームをスキップ
+                    let (_, consumed) = read_uleb128(&data[*offset..]);
+                    *offset += consumed;
+                }
+            } else {
+                // 他のコンテンツタイプをスキップ
+                let (_, consumed) = read_uleb128(&data[*offset..]);
+                *offset += consumed;
+            }
+        }
+        if !dir_name.is_empty() {
+            directories.push(dir_name);
+        }
+    }
+    
+    // ファイル名エントリフォーマット数
+    if *offset >= data.len() {
+        return (directories, file_names);
+    }
+    let file_name_entry_format_count = data[*offset];
+    *offset += 1;
+    
+    // ファイル名エントリフォーマット
+    let mut file_formats = Vec::new();
+    for _ in 0..file_name_entry_format_count {
+        if *offset >= data.len() {
+            break;
+        }
+        let (content_type, consumed) = read_uleb128(&data[*offset..]);
+        *offset += consumed;
+        let (form, consumed) = read_uleb128(&data[*offset..]);
+        *offset += consumed;
+        file_formats.push((content_type, form));
+    }
+    
+    // ファイル名数
+    if *offset >= data.len() {
+        return (directories, file_names);
+    }
+    let (file_names_count, consumed) = read_uleb128(&data[*offset..]);
+    *offset += consumed;
+    
+    // ファイル名エントリ
+    for _ in 0..file_names_count {
+        let mut file_name = String::new();
+        for (content_type, form) in &file_formats {
+            if *content_type == 1 { // DW_LNCT_path
+                if *form == 0x08 { // DW_FORM_string
+                    let (name, consumed) = extract_null_terminated_string(&data[*offset..]);
+                    file_name = name;
+                    *offset += consumed;
+                } else if *form == 0x0e { // DW_FORM_strp
+                    if *offset + 4 <= data.len() {
+                        let str_offset = u32::from_le_bytes([
+                            data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+                        ]);
+                        *offset += 4;
+                        file_name = format!("strp_offset_0x{:x}", str_offset);
+                    }
+                } else {
+                    // 他のフォームをスキップ
+                    let (_, consumed) = read_uleb128(&data[*offset..]);
+                    *offset += consumed;
+                }
+            } else {
+                // 他のコンテンツタイプをスキップ
+                let (_, consumed) = read_uleb128(&data[*offset..]);
+                *offset += consumed;
+            }
+        }
+        if !file_name.is_empty() {
+            file_names.push(file_name);
+        }
     }
     
     (directories, file_names)
