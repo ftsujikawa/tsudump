@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_variables, unused_mut, clippy::identity_op)]
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::env;
@@ -115,7 +115,7 @@ fn extract_from_fat_binary(buffer: &[u8]) -> Result<Vec<u8>, Box<dyn std::error:
         
         // Fat Archをバイト配列から直接読み取り
         let arch_bytes = &buffer[arch_offset..arch_offset + fat_arch_size];
-        let (cputype, cpusubtype, offset, size, align) = if is_swapped {
+        let (cputype, _cpusubtype, offset, size, _align) = if is_swapped {
             (
                 u32::from_le_bytes([arch_bytes[0], arch_bytes[1], arch_bytes[2], arch_bytes[3]]),
                 u32::from_le_bytes([arch_bytes[4], arch_bytes[5], arch_bytes[6], arch_bytes[7]]),
@@ -164,15 +164,7 @@ pub struct SectionInfo {
     pub addr: u64,
 }
 
-/*
-#[derive(Debug)]
-struct SymtabInfo {
-    symoff: u32,
-    nsyms: u32,
-    stroff: u32,
-    strsize: u32,
-}
-*/
+
 
 fn main() -> io::Result<()> {
     // ...（省略）
@@ -230,7 +222,7 @@ fn main() -> io::Result<()> {
         Header32(&'a mach_o_sys::loader::mach_header),
         Header64(&'a mach_header_64),
     }
-    let (sections, ncmds, macho_header) = if is_64 {
+    let (sections, _ncmds, macho_header) = if is_64 {
         let header: &mach_header_64 = unsafe { &*(actual_buffer.as_ptr() as *const mach_header_64) };
         (parse_load_commands_64(&actual_buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header64(header))
     } else if magic == MH_MAGIC {
@@ -337,20 +329,16 @@ fn main() -> io::Result<()> {
             let debug_aranges_data = get_section_data("__debug_aranges");
             
             // DWARF 5の新しいセクション
-            let debug_str_offsets_data = get_section_data("__debug_str_offsets");
-            let debug_addr_data = get_section_data("__debug_addr");
+            let _debug_str_offsets_data = get_section_data("__debug_str_offsets");
+            let _debug_addr_data = get_section_data("__debug_addr");
             let debug_line_str_data = get_section_data("__debug_line_str");
 
             let debug_info = DebugInfo::new(&debug_info_data, endian);
             let debug_abbrev = DebugAbbrev::new(&debug_abbrev_data, endian);
-            let debug_line = DebugLine::new(&debug_line_data, endian);
+            let _debug_line = DebugLine::new(&debug_line_data, endian);
             let debug_str = DebugStr::new(&debug_str_data, endian);
-            let debug_aranges = gimli::DebugAranges::new(&debug_aranges_data, endian);
-            
-            // DWARF 5のセクション（gimli 0.28では直接作成）
-            let _debug_str_offsets = &debug_str_offsets_data;
-            let _debug_addr = &debug_addr_data;
-            let debug_line_str = gimli::DebugLineStr::new(&debug_line_str_data, endian);
+            let _debug_aranges = gimli::DebugAranges::new(&debug_aranges_data, endian);
+            let _debug_line_str = gimli::DebugLineStr::new(&debug_line_str_data, endian);
 
             // __TEXTセグメントのベースアドレスを取得
             let text_base_addr = find_all_sections_in_segment(&sections, "__TEXT")
@@ -447,7 +435,7 @@ fn parse_load_commands_64(buffer: &[u8], ncmds: usize) -> HashMap<String, Sectio
             };
 
             let mut section_offset = offset + mem::size_of::<segment_command_64>();
-            for i in 0..seg_cmd.nsects as usize {
+            for _i in 0..seg_cmd.nsects as usize {
                 if section_offset + mem::size_of::<section_64>() > buffer.len() {
                     break;
                 }
@@ -479,9 +467,6 @@ fn parse_load_commands_64(buffer: &[u8], ncmds: usize) -> HashMap<String, Sectio
 
 fn parse_load_commands_32(buffer: &[u8], ncmds: usize) -> HashMap<String, SectionInfo> {
     use mach_o_sys::loader::{mach_header, segment_command, section, load_command};
-    use std::ffi::CStr;
-    use std::os::raw::c_char;
-    use std::mem;
     let mut sections = HashMap::new();
     let header_size = mem::size_of::<mach_header>();
     let mut offset = header_size;
@@ -991,7 +976,7 @@ fn display_debug_line_details_manual(buffer: &[u8], sections: &HashMap<String, S
         
         // ファイル名テーブルを解析（バージョン別）
         println!("\n  ファイル名テーブル:");
-        let (directories, file_names) = if version >= 5 {
+        let (_directories, file_names) = if version >= 5 {
             parse_dwarf5_file_table(section_data, &mut offset)
         } else {
             parse_dwarf2_4_file_table(section_data, &mut offset)
@@ -1103,7 +1088,7 @@ fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &mach_
     println!("{}", "=".repeat(80));
 }
 
-fn dump_data_sections(buffer: &[u8], sections: &[SectionInfo]) {
+fn dump_data_sections(_buffer: &[u8], sections: &[SectionInfo]) {
     if sections.is_empty() {
         println!("\n警告: __DATAセグメントにセクションが見つかりませんでした");
         return;
@@ -1129,7 +1114,6 @@ fn dump_data_sections(buffer: &[u8], sections: &[SectionInfo]) {
 fn display_stubs_symbols(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
     use mach_o_sys::loader::{symtab_command, LC_SYMTAB};
     use mach_o_sys::nlist::nlist_64;
-    use std::mem;
 
     println!("\n=== __stubsセクションに属するシンボル一覧 ===");
 
@@ -1273,7 +1257,6 @@ fn display_cstring_section(buffer: &[u8], section: &SectionInfo) {
 fn display_symbols(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
     use mach_o_sys::loader::{symtab_command, LC_SYMTAB};
     use mach_o_sys::nlist::nlist_64;
-    use std::mem;
 
     println!("------------------------------------------------------------");
     println!("  idx   アドレス            種別  外部  セクション  シンボル名");
@@ -2940,40 +2923,29 @@ fn parse_and_display_debug_aranges(buffer: &[u8], section: &SectionInfo) {
     }
 }
 
+// 未実装のdebug関数群（プレースホルダー）
 fn parse_and_display_debug_ranges(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __debug_ranges 詳細解析 ===");
-    println!("    範囲リストのサイズ: {} バイト", section.size);
-    println!("    (範囲リストの詳細解析は未実装)");
+    println!("    __debug_ranges: {} バイト (未実装)", section.size);
 }
 
 fn parse_and_display_debug_loc(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __debug_loc 詳細解析 ===");
-    println!("    ロケーションリストのサイズ: {} バイト", section.size);
-    println!("    (ロケーションリストの詳細解析は未実装)");
+    println!("    __debug_loc: {} バイト (未実装)", section.size);
 }
 
 fn parse_and_display_debug_pubnames(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __debug_pubnames 詳細解析 ===");
-    println!("    公開名前テーブルのサイズ: {} バイト", section.size);
-    println!("    (公開名前テーブルの詳細解析は未実装)");
+    println!("    __debug_pubnames: {} バイト (未実装)", section.size);
 }
 
 fn parse_and_display_debug_pubtypes(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __debug_pubtypes 詳細解析 ===");
-    println!("    公開型テーブルのサイズ: {} バイト", section.size);
-    println!("    (公開型テーブルの詳細解析は未実装)");
+    println!("    __debug_pubtypes: {} バイト (未実装)", section.size);
 }
 
 fn parse_and_display_debug_frame(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __debug_frame 詳細解析 ===");
-    println!("    フレーム情報のサイズ: {} バイト", section.size);
-    println!("    (フレーム情報の詳細解析は未実装)");
+    println!("    __debug_frame: {} バイト (未実装)", section.size);
 }
 
 fn parse_and_display_eh_frame(_buffer: &[u8], section: &SectionInfo) {
-    println!("    === __eh_frame 詳細解析 ===");
-    println!("    例外処理フレーム情報のサイズ: {} バイト", section.size);
-    println!("    (例外処理フレーム情報の詳細解析は未実装)");
+    println!("    __eh_frame: {} バイト (未実装)", section.size);
 }
 
 fn display_stubs_and_following_section(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
@@ -3131,7 +3103,7 @@ fn display_stubs_section(buffer: &[u8], section: &SectionInfo, is_64: bool) {
         if offset + 12 <= section_data.len() {
             // 例: adrp, add, ldr, br
             let adrp = u32::from_le_bytes([section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3]]);
-            let add  = u32::from_le_bytes([section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7]]);
+            let _add  = u32::from_le_bytes([section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7]]);
             let ldr  = u32::from_le_bytes([section_data[offset+8], section_data[offset+9], section_data[offset+10], section_data[offset+11]]);
             // 簡易判定: adrp命令は上位8bitが0x90~0x91、ldr命令は0xf9
             if (adrp & 0x9f000000) == 0x90000000 && (ldr & 0xff000000) == 0xf9000000 {
@@ -3519,7 +3491,7 @@ fn extract_dwarf_version(buffer: &[u8], section: &SectionInfo) -> Option<u16> {
     Some(version)
 }
 
-fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_base: i8, line_range: u8, opcode_base: u8) {
+fn parse_line_number_program(program_data: &[u8], _file_names: &[String], line_base: i8, line_range: u8, opcode_base: u8) {
     println!("Address            Line   Column File   ISA Discriminator OpIndex Flags");
     println!("------------------ ------ ------ ------ --- ------------- ------- -------------");
     
@@ -3538,7 +3510,7 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
     let mut op_index = 0u32;
     
     // 行情報を出力するヘルパー関数
-    let mut output_row = |addr: u64, ln: u32, col: u32, file_idx: u32, isa_val: u32, disc: u32, op_idx: u32,
+    let output_row = |addr: u64, ln: u32, col: u32, file_idx: u32, isa_val: u32, disc: u32, op_idx: u32,
                          stmt: bool, bb: bool, end_seq: bool, prol_end: bool, epil_begin: bool| {
         let mut flags = Vec::new();
         if stmt { flags.push("is_stmt"); }
@@ -3782,7 +3754,7 @@ fn attr_value_to_string<'a, R: gimli::Reader<Offset = usize>>(
                 Err(_) => "<invalid debug_str>".to_string(),
             }
         }
-        gimli::AttributeValue::DebugLineStrRef(str_ref) => {
+        gimli::AttributeValue::DebugLineStrRef(_str_ref) => {
             // DebugLineStrRef対応が必要ならここに追加
             "<DebugLineStrRef未対応>".to_string()
         }
