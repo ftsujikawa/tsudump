@@ -1968,6 +1968,60 @@ fn simple_disasm_arm64(code: &[u8], addr: u64) -> (String, usize) {
             format!("ldp x{}, x{}, [x{}, #{}]", rt, rt2, rn, offset)
         },
         
+        // MOVZ - 0xd2800000 | imm16 << 5 | rd
+        i if (i & 0xff800000) == 0xd2800000 => {
+            let imm16 = (i >> 5) & 0xffff;
+            let rd = i & 0x1f;
+            let shift = ((i >> 21) & 0x3) * 16;
+            format!("movz x{}, #{:#x}, lsl #{}", rd, imm16, shift)
+        },
+        // MOVK - 0xf2800000 | imm16 << 5 | rd
+        i if (i & 0xff800000) == 0xf2800000 => {
+            let imm16 = (i >> 5) & 0xffff;
+            let rd = i & 0x1f;
+            let shift = ((i >> 21) & 0x3) * 16;
+            format!("movk x{}, #{:#x}, lsl #{}", rd, imm16, shift)
+        },
+        // MOVN - 0x92800000 | imm16 << 5 | rd
+        i if (i & 0xff800000) == 0x92800000 => {
+            let imm16 = (i >> 5) & 0xffff;
+            let rd = i & 0x1f;
+            let shift = ((i >> 21) & 0x3) * 16;
+            format!("movn x{}, #{:#x}, lsl #{}", rd, imm16, shift)
+        },
+        // BR (register) - 0xd61f0000 | rn << 5
+        i if (i & 0xfffffc1f) == 0xd61f0000 => {
+            let rn = (i >> 5) & 0x1f;
+            format!("br x{}", rn)
+        },
+        // B.cond (conditional branch) - 0x54000000 | imm19 << 5 | cond
+        i if (i & 0xff000010) == 0x54000000 => {
+            let imm19 = (i >> 5) & 0x7ffff;
+            let cond = i & 0xf;
+            let offset = ((imm19 << 2) as i32) | if (imm19 & 0x40000) != 0 { !0x7ffff + 1 } else { 0 };
+            let target = (addr as i64 + offset as i64) as u64;
+            let cond_str = match cond {
+                0x0 => "eq", 0x1 => "ne", 0x2 => "cs", 0x3 => "cc",
+                0x4 => "mi", 0x5 => "pl", 0x6 => "vs", 0x7 => "vc",
+                0x8 => "hi", 0x9 => "ls", 0xa => "ge", 0xb => "lt",
+                0xc => "gt", 0xd => "le", 0xe => "al", _ => "nv"
+            };
+            format!("b.{} 0x{:x}", cond_str, target)
+        },
+        // STR (immediate) - 0xf9000000 | imm12 << 10 | rn << 5 | rt
+        i if (i & 0xffc00000) == 0xf9000000 => {
+            let imm12 = (i >> 10) & 0xfff;
+            let rn = (i >> 5) & 0x1f;
+            let rt = i & 0x1f;
+            format!("str x{}, [x{}, #{}]", rt, rn, imm12 * 8)
+        },
+        // CMP (register) - SUBS xzr, xn, xm
+        i if (i & 0xff20ffe0) == 0xeb00001f => {
+            let xn = (i >> 5) & 0x1f;
+            let xm = (i >> 16) & 0x1f;
+            format!("cmp x{}, x{}", xn, xm)
+        },
+        
         _ => format!(".word 0x{:08x}", inst),
     };
     
@@ -1999,6 +2053,57 @@ fn simple_disasm_arm32(code: &[u8], addr: u64) -> (String, usize) {
         i if i == 0x01a00000 => format!("nop{}", cond_str),
         // BX lr (0x012fff1e)
         0x012fff1e => format!("bx{} lr", cond_str),
+        // PUSH (STMFD sp!, {...})
+        _i if (inst & 0xffff0000) == 0xe92d0000 => {
+            let reglist = inst & 0xffff;
+            format!("push{} {{{:#06x}}}", cond_str, reglist)
+        },
+        // POP (LDMFD sp!, {...})
+        _i if (inst & 0xffff0000) == 0xe8bd0000 => {
+            let reglist = inst & 0xffff;
+            format!("pop{} {{{:#06x}}}", cond_str, reglist)
+        },
+        // LDM/STM (0xe8xxxxxx)
+        _i if (inst & 0xf8000000) == 0xe8000000 => {
+            let l = (inst >> 20) & 1;
+            let rn = (inst >> 16) & 0xf;
+            let reglist = inst & 0xffff;
+            if l == 1 {
+                format!("ldm{} r{}, {{{:#06x}}}", cond_str, rn, reglist)
+            } else {
+                format!("stm{} r{}, {{{:#06x}}}", cond_str, rn, reglist)
+            }
+        },
+        // BX (0x012fff10 or 0x012fff11)
+        _i if (inst & 0x0ffffff0) == 0x012fff10 => {
+            let rm = inst & 0xf;
+            format!("bx{} r{}", cond_str, rm)
+        },
+        // BLX (immediate, 0xfa000000)
+        _i if (inst & 0xfe000000) == 0xfa000000 => {
+            let offset = (inst & 0x00ffffff) as i32;
+            let sign_extended = if offset & 0x00800000 != 0 {
+                offset | (-16777216i32)
+            } else {
+                offset
+            };
+            let target = (addr as i64 + (sign_extended * 4) as i64 + 8) as u64;
+            format!("blx{} 0x{:x}", cond_str, target)
+        },
+        // CMP (immediate)
+        _i if ((inst >> 21) & 0xf) == 0xa && ((inst >> 25) & 0x7) == 0x1 => {
+            let rn = (inst >> 16) & 0xf;
+            let imm = inst & 0xff;
+            let rot = (inst >> 8) & 0xf;
+            let rotated_imm = imm.rotate_right(rot * 2);
+            format!("cmp{} r{}, #{}", cond_str, rn, rotated_imm)
+        },
+        // CMP (register)
+        _i if ((inst >> 21) & 0xf) == 0xa && ((inst >> 25) & 0x7) == 0x0 => {
+            let rn = (inst >> 16) & 0xf;
+            let rm = inst & 0xf;
+            format!("cmp{} r{}, r{}", cond_str, rn, rm)
+        },
         _ => {
             match (inst >> 25) & 0x7 {
                 // データ処理命令 (bits 27-25 = 000)
