@@ -13,6 +13,46 @@ use std::str;
 use gimli::{DebugAbbrev, DebugInfo, DebugLine, DebugStr, EndianSlice, LittleEndian, Reader};
 use mach_o_sys::loader::*;
 
+// Mach-O CPUタイプ定数
+const CPU_TYPE_X86: u32 = 7;
+const CPU_TYPE_X86_64: u32 = 0x01000007; // CPU_TYPE_X86 | CPU_ARCH_ABI64
+const CPU_TYPE_ARM: u32 = 12;
+const CPU_TYPE_ARM64: u32 = 0x0100000c; // CPU_TYPE_ARM | CPU_ARCH_ABI64
+const CPU_TYPE_ARM64_32: u32 = 0x0200000c; // CPU_TYPE_ARM | CPU_ARCH_ABI64_32
+
+// CPUアーキテクチャを表す列挙型
+#[derive(Debug, Clone, PartialEq)]
+enum CpuArchitecture {
+    X86_64,
+    ARM64,
+    ARM32,
+    Unknown(u32),
+}
+
+impl CpuArchitecture {
+    /// Mach-OヘッダのcputypeからCPUアーキテクチャを判定
+    fn from_mach_cputype(cputype: i32) -> Self {
+        // i32をu32に変換して処理
+        let cputype_u32 = cputype as u32;
+        match cputype_u32 {
+            CPU_TYPE_X86_64 => CpuArchitecture::X86_64,
+            CPU_TYPE_ARM64 | CPU_TYPE_ARM64_32 => CpuArchitecture::ARM64,
+            CPU_TYPE_ARM => CpuArchitecture::ARM32,
+            _ => CpuArchitecture::Unknown(cputype_u32),
+        }
+    }
+    
+    /// アーキテクチャ名を文字列で取得
+    fn name(&self) -> &'static str {
+        match self {
+            CpuArchitecture::X86_64 => "x86_64",
+            CpuArchitecture::ARM64 => "arm64",
+            CpuArchitecture::ARM32 => "arm32",
+            CpuArchitecture::Unknown(_) => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SectionInfo {
     pub name: String,
@@ -893,43 +933,38 @@ fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &mach_
     println!("ファイルオフセット: 0x{:08x}", section.offset);
     
     // CPUアーキテクチャを判定
-    let arch = match header.cputype {
-    16777223 | 117440513 => "x86_64", // Intel x86_64 (u32)
-    16777228 | 201326593 => "arm64",  // Apple ARM64 (u32)
-    12 => "arm",                      // ARM 32-bit
-    _ => match header.cputype as i32 {
-        16777223 | 117440513 => "x86_64", // Intel x86_64 (i32)
-        16777228 | 201326593 => "arm64",  // Apple ARM64 (i32)
-        12 => "arm",
-        _ => "unknown",
+    let arch = CpuArchitecture::from_mach_cputype(header.cputype);
+    println!("アーキテクチャ: {} (cputype: {} / 0x{:08x})", arch.name(), header.cputype, header.cputype);
+    println!("{}", "=".repeat(80));
+
+    let start_offset = section.offset as usize;
+    let end_offset = start_offset + std::cmp::min(section.size as usize, 400); // 最初の400バイトまで
+
+    if start_offset >= buffer.len() {
+        println!("エラー: セクションオフセットがファイルサイズを超えています");
+        return;
     }
-};
-println!("アーキテクチャ: {} (cputype: {} / 0x{:08x} [{}])", arch, header.cputype, header.cputype, if (header.cputype as i32) < 0 { "i32(負)" } else { "i32(正)" });
-println!("{}", "=".repeat(80));
 
-let start_offset = section.offset as usize;
-let end_offset = start_offset + std::cmp::min(section.size as usize, 400); // 最初の400バイトまで
+    let actual_end = std::cmp::min(end_offset, buffer.len());
+    let mut addr = section.addr;
+    let mut i = start_offset;
 
-if start_offset >= buffer.len() {
-    println!("エラー: セクションオフセットがファイルサイズを超えています");
-    return;
-}
-
-let actual_end = std::cmp::min(end_offset, buffer.len());
-let mut addr = section.addr;
-let mut i = start_offset;
-
-while i < actual_end {
-    // x86_64とarm64で明示的に逆アセンブラを分岐
-    let (instruction, inst_len) = if arch == "x86_64" {
-        simple_disasm_x86_64(&buffer[i..actual_end], addr)
-    } else if arch == "arm64" {
-        simple_disasm_arm64(&buffer[i..actual_end], addr)
-    } else if arch == "arm" {
-        simple_disasm_arm32(&buffer[i..actual_end], addr)
-    } else {
-        (format!("不明なアーキテクチャ: {}", arch), 4)
-    };
+    while i < actual_end {
+        // CPUアーキテクチャに応じて適切な逆アセンブラを選択
+        let (instruction, inst_len) = match arch {
+            CpuArchitecture::X86_64 => {
+                simple_disasm_x86_64(&buffer[i..actual_end], addr)
+            },
+            CpuArchitecture::ARM64 => {
+                simple_disasm_arm64(&buffer[i..actual_end], addr)
+            },
+            CpuArchitecture::ARM32 => {
+                simple_disasm_arm32(&buffer[i..actual_end], addr)
+            },
+            CpuArchitecture::Unknown(cputype) => {
+                (format!("不明なアーキテクチャ: {} (cputype: 0x{:x})", arch.name(), cputype), 4)
+            },
+        };
 
         
         // アドレスと命令バイト・命令名を簡潔に表示（常に64ビット幅）
@@ -1150,24 +1185,51 @@ fn display_symbols(buffer: &[u8], sections: &HashMap<String, SectionInfo>) {
             let strtab = &buffer[strtab_start..strtab_end];
             for i in 0..(symtab.nsyms as usize) {
                 let symbol_offset = i * symbol_size;
-                let nlist: &mut nlist_64 = unsafe {
-                    &mut *(symtab_slice.as_ptr().add(symbol_offset) as *mut nlist_64)
-                };
-                let n_strx = unsafe { nlist.n_un.n_strx() } as usize;
-                let n_type = nlist.n_type;
-                let n_sect = nlist.n_sect;
-                let n_value = nlist.n_value;
+                if symbol_offset + symbol_size > symtab_slice.len() {
+                    println!("シンボル{}が範囲外です", i);
+                    break;
+                }
+                
+                // nlist_64構造体を安全に読み取り（バイト配列から直接読み取り）
+                let symbol_bytes = &symtab_slice[symbol_offset..symbol_offset + symbol_size];
+                
+                // リトルエンディアンで32ビット値を読み取り
+                let n_strx = u32::from_le_bytes([
+                    symbol_bytes[0], symbol_bytes[1], symbol_bytes[2], symbol_bytes[3]
+                ]) as usize;
+                let n_type = symbol_bytes[4];
+                let n_sect = symbol_bytes[5];
+                // n_desc (2バイト) は6-7番目
+                let n_value = u64::from_le_bytes([
+                    symbol_bytes[8], symbol_bytes[9], symbol_bytes[10], symbol_bytes[11],
+                    symbol_bytes[12], symbol_bytes[13], symbol_bytes[14], symbol_bytes[15]
+                ]);
+                
+                // シンボル名を取得（改善版）
                 let symbol_name = if n_strx == 0 {
                     "<無名>".to_string()
                 } else if n_strx < strtab.len() {
-                    let name_bytes = &strtab[n_strx..];
-                    match name_bytes.iter().position(|&b| b == 0) {
-                        Some(0) => "<空>".to_string(),
-                        Some(len) => String::from_utf8_lossy(&name_bytes[..len]).to_string(),
-                        None => String::from_utf8_lossy(name_bytes).to_string(),
+                    // 文字列テーブルから null終端文字列を安全に取得
+                    let remaining_bytes = &strtab[n_strx..];
+                    if let Some(null_pos) = remaining_bytes.iter().position(|&b| b == 0) {
+                        if null_pos == 0 {
+                            "<空文字列>".to_string()
+                        } else {
+                            // null終端までの文字列を取得
+                            let name_bytes = &remaining_bytes[..null_pos];
+                            String::from_utf8_lossy(name_bytes).to_string()
+                        }
+                    } else {
+                        // null終端が見つからない場合は残り全体を使用
+                        let name_str = String::from_utf8_lossy(remaining_bytes).to_string();
+                        if name_str.trim().is_empty() {
+                            "<null終端なし空>".to_string()
+                        } else {
+                            name_str
+                        }
                     }
                 } else {
-                    "<無効>".to_string()
+                    format!("<範囲外:strx={}/{}>", n_strx, strtab.len())
                 };
                 let type_str = match n_type & 0x0e {
                     0x0e => "SECT",
@@ -1907,11 +1969,11 @@ fn display_macho_header(header: &mach_header_64) {
     };
     println!("マジックナンバー: {} (0x{:08x})", magic_str, header.magic);
     
-    // CPUタイプ
+    // CPUタイプ（正しいMach-O定数を使用）
     let cpu_str = match header.cputype {
         1 => "VAX",
         6 => "MC680x0",
-        7 => "Intel x86",
+        7 => "Intel x86 (i386)",
         10 => "MC98000",
         11 => "HPPA",
         12 => "ARM",
@@ -1920,26 +1982,67 @@ fn display_macho_header(header: &mach_header_64) {
         15 => "Intel i860",
         16 => "PowerPC",
         18 => "PowerPC 64",
-        16777223 => "Intel x86_64", // 0x01000007
-        16777228 => "ARM64",        // 0x0100000c
-        117440513 => "Intel x86_64 (バイトオーダー問題)", // 0x07000001 (実際の読み取り値)
-        50331648 => "x86_64 サブタイプ (バイトオーダー問題)",
-        201326593 => "ARM64", // 0x03000000
+        16777223 => "Intel x86_64",  // 0x01000007 = CPU_TYPE_X86_64
+        16777228 => "ARM64",         // 0x0100000c = CPU_TYPE_ARM64
         _ => "不明",
     };
     println!("CPUタイプ: {} ({})", cpu_str, header.cputype);
     
-    // CPUサブタイプ
-    let subtype_str = match (header.cputype, header.cpusubtype) {
-        (16777223, 3) => "x86_64 All",        // 0x01000007, 3
-        (16777223, 4) => "x86_64 Haswell",    // 0x01000007, 4
-        (16777228, 0) => "ARM64 All",         // 0x0100000c, 0
-        (16777228, 1) => "ARM64 v8",          // 0x0100000c, 1
-        (16777228, 2) => "ARM64e",            // 0x0100000c, 2
-        (117440513, 50331648) => "x86_64 All (バイトオーダー問題)", // 実際の読み取り値
+    // CPUサブタイプ（正しいMach-O定数を使用）
+    let subtype_str = match (header.cputype, header.cpusubtype & 0xFFFFFF) { // マスクして能力フラグを除去
+        // x86_64サブタイプ
+        (16777223, 3) => "x86_64 All",
+        (16777223, 4) => "x86_64 Haswell",
+        (16777223, 8) => "x86_64 Haswell",
+        // ARM64サブタイプ
+        (16777228, 0) => "ARM64 All",
+        (16777228, 1) => "ARM64 v8",
+        (16777228, 2) => "ARM64e",
+        // i386サブタイプ
+        (7, 3) => "i386 All",
+        (7, 4) => "i386 486",
+        (7, 5) => "i386 586",
+        (7, 8) => "i386 Pentium III",
+        (7, 9) => "i386 Pentium M",
+        (7, 10) => "i386 Pentium 4",
+        (7, 11) => "i386 Itanium",
+        (7, 12) => "i386 Xeon",
+        // ARM32サブタイプ
+        (12, 0) => "ARM All",
+        (12, 5) => "ARM v4T",
+        (12, 6) => "ARM v6",
+        (12, 7) => "ARM v5TEJ",
+        (12, 8) => "ARM XSCALE",
+        (12, 9) => "ARM v7",
+        (12, 10) => "ARM v7F",
+        (12, 11) => "ARM v7S",
+        (12, 12) => "ARM v7K",
+        (12, 14) => "ARM v8",
+        // PowerPCサブタイプ
+        (16, 0) => "PowerPC All",
+        (16, 1) => "PowerPC 601",
+        (16, 2) => "PowerPC 602",
+        (16, 3) => "PowerPC 603",
+        (16, 4) => "PowerPC 603e",
+        (16, 5) => "PowerPC 603ev",
+        (16, 6) => "PowerPC 604",
+        (16, 7) => "PowerPC 604e",
+        (16, 8) => "PowerPC 620",
+        (16, 9) => "PowerPC 750",
+        (16, 10) => "PowerPC 7400",
+        (16, 11) => "PowerPC 7450",
+        (16, 100) => "PowerPC 970",
         _ => "不明",
     };
-    println!("CPUサブタイプ: {} ({})", subtype_str, header.cpusubtype);
+    // CPUサブタイプの詳細情報も表示
+    let capability_flags = header.cpusubtype & 0xFF000000u32 as i32;
+    println!("CPUサブタイプ: {} (0x{:08x})", subtype_str, header.cpusubtype);
+    if capability_flags != 0 {
+        println!("  能力フラグ: 0x{:08x}", capability_flags);
+        if capability_flags & (0x80000000u32 as i32) != 0 {
+            println!("    - LIB64: 64ビットライブラリサポート");
+        }
+    }
     
     // ファイルタイプ
     let filetype_str = match header.filetype {
@@ -3415,7 +3518,13 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
                     // DW_LNS_advance_line
                     let (advance, consumed) = read_sleb128(&program_data[offset..]);
                     offset += consumed;
-                    line = (line as i64 + advance) as u32;
+                    // 符号付き演算で行番号を正しく計算
+                    let new_line = (line as i64) + advance;
+                    line = if new_line < 0 {
+                        0  // 負の値になった場合は0にクランプ
+                    } else {
+                        new_line as u32
+                    };
                 },
                 4 => {
                     // DW_LNS_set_file
@@ -3476,7 +3585,13 @@ fn parse_line_number_program(program_data: &[u8], file_names: &[String], line_ba
             let line_advance = line_base + (adjusted_opcode % line_range) as i8;
             
             address += addr_advance;
-            line = (line as i64 + line_advance as i64) as u32;
+            // 符号付き演算で行番号を正しく計算
+            let new_line = (line as i64) + (line_advance as i64);
+            line = if new_line < 0 {
+                0  // 負の値になった場合は0にクランプ
+            } else {
+                new_line as u32
+            };
             
             output_row(address, line, column, file_index, isa, discriminator, op_index,
                       is_stmt, basic_block, end_sequence, prologue_end, epilogue_begin);
@@ -3721,14 +3836,18 @@ fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec
     let mut directories = Vec::new();
     let mut file_names = Vec::new();
     
+    println!("    [DEBUG] DWARF5ファイルテーブル解析開始, offset: {}", *offset);
+    
     // DWARF 5では新しいファイルテーブル形式
     if *offset + 1 >= data.len() {
+        println!("    [DEBUG] データが不足しています");
         return (directories, file_names);
     }
     
     // ディレクトリエントリフォーマット数
     let directory_entry_format_count = data[*offset];
     *offset += 1;
+    println!("    [DEBUG] ディレクトリエントリフォーマット数: {}", directory_entry_format_count);
     
     // ディレクトリエントリフォーマット
     let mut dir_formats = Vec::new();
@@ -3745,18 +3864,23 @@ fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec
     
     // ディレクトリ数
     if *offset >= data.len() {
+        println!("    [DEBUG] ディレクトリ数読み取り前にデータが不足");
         return (directories, file_names);
     }
     let (directories_count, consumed) = read_uleb128(&data[*offset..]);
     *offset += consumed;
+    println!("    [DEBUG] ディレクトリ数: {}", directories_count);
     
     // ディレクトリエントリ
-    for _ in 0..directories_count {
+    for i in 0..directories_count {
         let mut dir_name = String::new();
-        for (content_type, form) in &dir_formats {
+        println!("    [DEBUG] ディレクトリエントリ {} 解析中, offset: {}", i, *offset);
+        for (j, (content_type, form)) in dir_formats.iter().enumerate() {
+            println!("    [DEBUG]   フォーマット {}: content_type={}, form=0x{:x}", j, content_type, form);
             if *content_type == 1 { // DW_LNCT_path
                 if *form == 0x08 { // DW_FORM_string
                     let (name, consumed) = extract_null_terminated_string(&data[*offset..]);
+                    println!("    [DEBUG]   DW_FORM_string: '{}'", name);
                     dir_name = name;
                     *offset += consumed;
                 } else if *form == 0x0e { // DW_FORM_strp
@@ -3766,18 +3890,31 @@ fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec
                         ]);
                         *offset += 4;
                         dir_name = format!("strp_offset_0x{:x}", str_offset);
+                        println!("    [DEBUG]   DW_FORM_strp: {}", dir_name);
+                    }
+                } else if *form == 0x1f { // DW_FORM_line_strp
+                    if *offset + 4 <= data.len() {
+                        let str_offset = u32::from_le_bytes([
+                            data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+                        ]);
+                        *offset += 4;
+                        dir_name = format!("line_strp_offset_0x{:x}", str_offset);
+                        println!("    [DEBUG]   DW_FORM_line_strp: {}", dir_name);
                     }
                 } else {
                     // 他のフォームをスキップ
-                    let (_, consumed) = read_uleb128(&data[*offset..]);
+                    let (value, consumed) = read_uleb128(&data[*offset..]);
+                    println!("    [DEBUG]   未対応フォーム 0x{:x}: value={}, consumed={}", form, value, consumed);
                     *offset += consumed;
                 }
             } else {
                 // 他のコンテンツタイプをスキップ
-                let (_, consumed) = read_uleb128(&data[*offset..]);
+                let (value, consumed) = read_uleb128(&data[*offset..]);
+                println!("    [DEBUG]   未対応コンテンツタイプ {}: value={}, consumed={}", content_type, value, consumed);
                 *offset += consumed;
             }
         }
+        println!("    [DEBUG] ディレクトリ名: '{}'", dir_name);
         if !dir_name.is_empty() {
             directories.push(dir_name);
         }
@@ -3805,18 +3942,23 @@ fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec
     
     // ファイル名数
     if *offset >= data.len() {
+        println!("    [DEBUG] ファイル名数読み取り前にデータが不足");
         return (directories, file_names);
     }
     let (file_names_count, consumed) = read_uleb128(&data[*offset..]);
     *offset += consumed;
+    println!("    [DEBUG] ファイル名数: {}", file_names_count);
     
     // ファイル名エントリ
-    for _ in 0..file_names_count {
+    for i in 0..file_names_count {
         let mut file_name = String::new();
-        for (content_type, form) in &file_formats {
+        println!("    [DEBUG] ファイル名エントリ {} 解析中, offset: {}", i, *offset);
+        for (j, (content_type, form)) in file_formats.iter().enumerate() {
+            println!("    [DEBUG]   フォーマット {}: content_type={}, form=0x{:x}", j, content_type, form);
             if *content_type == 1 { // DW_LNCT_path
                 if *form == 0x08 { // DW_FORM_string
                     let (name, consumed) = extract_null_terminated_string(&data[*offset..]);
+                    println!("    [DEBUG]   DW_FORM_string: '{}'", name);
                     file_name = name;
                     *offset += consumed;
                 } else if *form == 0x0e { // DW_FORM_strp
@@ -3826,18 +3968,31 @@ fn parse_dwarf5_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, Vec
                         ]);
                         *offset += 4;
                         file_name = format!("strp_offset_0x{:x}", str_offset);
+                        println!("    [DEBUG]   DW_FORM_strp: {}", file_name);
+                    }
+                } else if *form == 0x1f { // DW_FORM_line_strp
+                    if *offset + 4 <= data.len() {
+                        let str_offset = u32::from_le_bytes([
+                            data[*offset], data[*offset + 1], data[*offset + 2], data[*offset + 3]
+                        ]);
+                        *offset += 4;
+                        file_name = format!("line_strp_offset_0x{:x}", str_offset);
+                        println!("    [DEBUG]   DW_FORM_line_strp: {}", file_name);
                     }
                 } else {
                     // 他のフォームをスキップ
-                    let (_, consumed) = read_uleb128(&data[*offset..]);
+                    let (value, consumed) = read_uleb128(&data[*offset..]);
+                    println!("    [DEBUG]   未対応フォーム 0x{:x}: value={}, consumed={}", form, value, consumed);
                     *offset += consumed;
                 }
             } else {
                 // 他のコンテンツタイプをスキップ
-                let (_, consumed) = read_uleb128(&data[*offset..]);
+                let (value, consumed) = read_uleb128(&data[*offset..]);
+                println!("    [DEBUG]   未対応コンテンツタイプ {}: value={}, consumed={}", content_type, value, consumed);
                 *offset += consumed;
             }
         }
+        println!("    [DEBUG] ファイル名: '{}'", file_name);
         if !file_name.is_empty() {
             file_names.push(file_name);
         }
