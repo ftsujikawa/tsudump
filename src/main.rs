@@ -20,6 +20,28 @@ const CPU_TYPE_ARM: u32 = 12;
 const CPU_TYPE_ARM64: u32 = 0x0100000c; // CPU_TYPE_ARM | CPU_ARCH_ABI64
 const CPU_TYPE_ARM64_32: u32 = 0x0200000c; // CPU_TYPE_ARM | CPU_ARCH_ABI64_32
 
+// Fat Binary（Universal Binary）定数
+const FAT_MAGIC: u32 = 0xcafebabe;
+const FAT_CIGAM: u32 = 0xbebafeca; // バイトスワップされたFAT_MAGIC
+
+// Fat Binary ヘッダ構造
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct FatHeader {
+    magic: u32,
+    nfat_arch: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct FatArch {
+    cputype: u32,
+    cpusubtype: u32,
+    offset: u32,
+    size: u32,
+    align: u32,
+}
+
 // CPUアーキテクチャを表す列挙型
 #[derive(Debug, Clone, PartialEq)]
 enum CpuArchitecture {
@@ -51,6 +73,86 @@ impl CpuArchitecture {
             CpuArchitecture::Unknown(_) => "unknown",
         }
     }
+}
+
+/// Fat Binaryから適切なアーキテクチャを選択してMach-Oバイナリを抽出
+fn extract_from_fat_binary(buffer: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if buffer.len() < std::mem::size_of::<FatHeader>() {
+        return Err("ファイルサイズが小さすぎます".into());
+    }
+    
+    // Fat Headerをバイト配列から直接読み取り
+    let magic = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    let is_swapped = magic == FAT_CIGAM;
+    
+    if magic != FAT_MAGIC && magic != FAT_CIGAM {
+        return Err(format!("Fat Binaryのマジックナンバーが不正です: 0x{:08x}", magic).into());
+    }
+    
+    let nfat_arch = if is_swapped {
+        u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]])
+    } else {
+        u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]])
+    };
+    
+    // アーキテクチャ数の妄当性をチェック
+    if nfat_arch == 0 || nfat_arch > 10 {
+        return Err(format!("不正なアーキテクチャ数: {}", nfat_arch).into());
+    }
+    
+    println!("Fat Binary検出: {} 個のアーキテクチャが含まれています", nfat_arch);
+    
+    let fat_arch_size = 20; // FatArchのサイズ（u32 × 5 = 20バイト）
+    let fat_arch_start = 8; // FatHeaderのサイズ（u32 × 2 = 8バイト）
+    
+    // 各アーキテクチャをリストアップ
+    for i in 0..nfat_arch {
+        let arch_offset = fat_arch_start + (i as usize * fat_arch_size);
+        if arch_offset + fat_arch_size > buffer.len() {
+            println!("　アーキテクチャ {}: バッファ範囲外", i);
+            continue;
+        }
+        
+        // Fat Archをバイト配列から直接読み取り
+        let arch_bytes = &buffer[arch_offset..arch_offset + fat_arch_size];
+        let (cputype, cpusubtype, offset, size, align) = if is_swapped {
+            (
+                u32::from_le_bytes([arch_bytes[0], arch_bytes[1], arch_bytes[2], arch_bytes[3]]),
+                u32::from_le_bytes([arch_bytes[4], arch_bytes[5], arch_bytes[6], arch_bytes[7]]),
+                u32::from_le_bytes([arch_bytes[8], arch_bytes[9], arch_bytes[10], arch_bytes[11]]),
+                u32::from_le_bytes([arch_bytes[12], arch_bytes[13], arch_bytes[14], arch_bytes[15]]),
+                u32::from_le_bytes([arch_bytes[16], arch_bytes[17], arch_bytes[18], arch_bytes[19]])
+            )
+        } else {
+            (
+                u32::from_be_bytes([arch_bytes[0], arch_bytes[1], arch_bytes[2], arch_bytes[3]]),
+                u32::from_be_bytes([arch_bytes[4], arch_bytes[5], arch_bytes[6], arch_bytes[7]]),
+                u32::from_be_bytes([arch_bytes[8], arch_bytes[9], arch_bytes[10], arch_bytes[11]]),
+                u32::from_be_bytes([arch_bytes[12], arch_bytes[13], arch_bytes[14], arch_bytes[15]]),
+                u32::from_be_bytes([arch_bytes[16], arch_bytes[17], arch_bytes[18], arch_bytes[19]])
+            )
+        };
+        
+        let arch = CpuArchitecture::from_mach_cputype(cputype as i32);
+        println!("　アーキテクチャ {}: {} (cputype: 0x{:x}, offset: 0x{:x}, size: {})", 
+                 i, arch.name(), cputype, offset, size);
+        
+        // 有効なアーキテクチャをチェック（サイズが0ではなく、範囲内にある）
+        if size > 0 && offset > 0 && offset as usize + size as usize <= buffer.len() {
+            // アーキテクチャが既知のものかどうかをチェック
+            if !matches!(arch, CpuArchitecture::Unknown(_)) {
+                println!("アーキテクチャ {} ({}) を選択しました", i, arch.name());
+                let extracted = buffer[offset as usize..(offset + size) as usize].to_vec();
+                if extracted.len() >= 4 {
+                    return Ok(extracted);
+                }
+            }
+        } else {
+            println!("　アーキテクチャ {}: 無効なデータ (offset: 0x{:x}, size: {})", i, offset, size);
+        }
+    }
+    
+    Err("有効なアーキテクチャが見つかりません".into())
 }
 
 #[derive(Debug, Clone)]
@@ -105,18 +207,36 @@ fn main() -> io::Result<()> {
     file.read_to_end(&mut buffer)?;
 
     let magic = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    
+    // Fat Binaryの場合は適切なアーキテクチャを抽出
+    let actual_buffer = if magic == FAT_MAGIC || magic == FAT_CIGAM {
+        match extract_from_fat_binary(&buffer) {
+            Ok(extracted) => {
+                println!("");
+                extracted
+            },
+            Err(e) => {
+                println!("エラー: Fat Binaryの処理に失敗しました: {}", e);
+                return Ok(());
+            }
+        }
+    } else {
+        buffer
+    };
+    
+    let magic = u32::from_le_bytes([actual_buffer[0], actual_buffer[1], actual_buffer[2], actual_buffer[3]]);
     let is_64 = magic == MH_MAGIC_64;
     enum MachHeader<'a> {
         Header32(&'a mach_o_sys::loader::mach_header),
         Header64(&'a mach_header_64),
     }
     let (sections, ncmds, macho_header) = if is_64 {
-        let header: &mach_header_64 = unsafe { &*(buffer.as_ptr() as *const mach_header_64) };
-        (parse_load_commands_64(&buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header64(header))
+        let header: &mach_header_64 = unsafe { &*(actual_buffer.as_ptr() as *const mach_header_64) };
+        (parse_load_commands_64(&actual_buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header64(header))
     } else if magic == MH_MAGIC {
         use mach_o_sys::loader::mach_header;
-        let header: &mach_header = unsafe { &*(buffer.as_ptr() as *const mach_header) };
-        (parse_load_commands_32(&buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header32(header))
+        let header: &mach_header = unsafe { &*(actual_buffer.as_ptr() as *const mach_header) };
+        (parse_load_commands_32(&actual_buffer, header.ncmds as usize), header.ncmds as usize, MachHeader::Header32(header))
     } else {
         println!("エラー: 未対応または不正なMach-Oファイルです (magic=0x{:08x})", magic);
         return Ok(());
@@ -125,39 +245,39 @@ fn main() -> io::Result<()> {
     match command.as_str() {
         "--cstring" => {
             match find_section_by_name(&sections, "__cstring") {
-                Some(section) => display_cstring_section(&buffer, section),
+                Some(section) => display_cstring_section(&actual_buffer, section),
                 None => println!("__cstringセクションが見つかりません"),
             }
             return Ok(());
         }
         "--unwind-info" => {
             match find_section_by_name(&sections, "__unwind_info") {
-                Some(section) => display_unwind_info_section(&buffer, section),
+                Some(section) => display_unwind_info_section(&actual_buffer, section),
                 None => println!("__unwind_infoセクションが見つかりません"),
             }
             return Ok(());
         }
         "--got" => {
             match find_section_by_name(&sections, "__got") {
-                Some(section) => display_got_section(&buffer, section),
+                Some(section) => display_got_section(&actual_buffer, section),
                 None => println!("__gotセクションが見つかりません"),
             }
             return Ok(());
         }
         "--stubs-follow" => {
-            display_stubs_and_following_section(&buffer, &sections);
+            display_stubs_and_following_section(&actual_buffer, &sections);
             return Ok(());
         }
         "--stubs" => {
             match find_section_by_name(&sections, "__stubs") {
-                Some(section) => display_stubs_section(&buffer, section, is_64),
+                Some(section) => display_stubs_section(&actual_buffer, section, is_64),
                 None => println!("__stubsセクションが見つかりません"),
             }
             return Ok(());
         }
         "--apple-names" => {
             match find_section_by_name(&sections, "__apple_names") {
-                Some(section) => display_apple_names_section(&buffer, section),
+                Some(section) => display_apple_names_section(&actual_buffer, section),
                 None => println!("__apple_namesセクションが見つかりません"),
             }
             return Ok(());
@@ -177,11 +297,11 @@ fn main() -> io::Result<()> {
                 );
             }
         }
-        "--symbols" => display_symbols(&buffer, &sections),
+        "--symbols" => display_symbols(&actual_buffer, &sections),
         "--disassemble" => {
             if let Some(text_section) = find_section_by_name(&sections, "__text") {
                 match macho_header {
-                    MachHeader::Header64(header64) => disassemble_text_section(&buffer, text_section, header64),
+                    MachHeader::Header64(header64) => disassemble_text_section(&actual_buffer, text_section, header64),
                     MachHeader::Header32(_) => println!("32ビットMach-Oの逆アセンブルは未対応です。"),
                 }
             } else {
@@ -191,7 +311,7 @@ fn main() -> io::Result<()> {
         "--dump-data" => {
             let data_sections: Vec<&SectionInfo> = find_all_sections_in_segment(&sections, "__DATA");
             let owned_sections: Vec<SectionInfo> = data_sections.into_iter().cloned().collect();
-            dump_data_sections(&buffer, &owned_sections);
+            dump_data_sections(&actual_buffer, &owned_sections);
         },
         "--debug-info" | "--debug-abbrev" | "--debug-aranges" | "--debug-line" | "--debug-str-offsets" | "--debug-addr" => {
             let endian = LittleEndian;
@@ -201,10 +321,10 @@ fn main() -> io::Result<()> {
                     Some(section) => {
                         let start = section.offset as usize;
                         let end = start + section.size as usize;
-                        if end > buffer.len() {
+                        if end > actual_buffer.len() {
                             return EndianSlice::new(&[], endian);
                         }
-                        EndianSlice::new(&buffer[start..end], endian)
+                        EndianSlice::new(&actual_buffer[start..end], endian)
                     }
                     None => EndianSlice::new(&[], endian),
                 }
@@ -247,7 +367,7 @@ fn main() -> io::Result<()> {
                     if let Some(section) = find_section_by_name(&sections, "__debug_abbrev") {
                         let mut units = debug_info.units();
                         if let Ok(Some(unit)) = units.next() {
-                             parse_and_display_debug_abbrev(&buffer, section, unit.version());
+                             parse_and_display_debug_abbrev(&actual_buffer, section, unit.version());
                         } else {
                             println!("__debug_infoからユニットを読み込めません");
                         }
@@ -258,19 +378,19 @@ fn main() -> io::Result<()> {
                 }
                 "--debug-aranges" => {
                     if let Some(section) = find_section_by_name(&sections, "__debug_aranges") {
-                        parse_and_display_debug_aranges(&buffer, section);
+                        parse_and_display_debug_aranges(&actual_buffer, section);
                     } else {
                         println!("__debug_arangesセクションが見つかりません");
                     }
                     Ok(())
                 }
                 "--debug-line" => {
-                    display_debug_line_details_manual(&buffer, &sections);
+                    display_debug_line_details_manual(&actual_buffer, &sections);
                     Ok(())
                 }
                 "--debug-str-offsets" => {
                     if let Some(section) = find_section_by_name(&sections, "__debug_str_offsets") {
-                        parse_and_display_debug_str_offsets(&buffer, section);
+                        parse_and_display_debug_str_offsets(&actual_buffer, section);
                     } else {
                         println!("__debug_str_offsetsセクションが見つかりません");
                     }
@@ -278,7 +398,7 @@ fn main() -> io::Result<()> {
                 }
                 "--debug-addr" => {
                     if let Some(section) = find_section_by_name(&sections, "__debug_addr") {
-                        parse_and_display_debug_addr(&buffer, section);
+                        parse_and_display_debug_addr(&actual_buffer, section);
                     } else {
                         println!("__debug_addrセクションが見つかりません");
                     }
@@ -1963,8 +2083,10 @@ fn display_macho_header(header: &mach_header_64) {
     
     // マジックナンバー
     let magic_str = match header.magic {
-        0xcffaedfe => "MH_MAGIC_64 (リトルエンディアン)",
-        0xfeedfacf => "MH_MAGIC_64 (ビッグエンディアン)",
+        0xfeedfacf => "MH_MAGIC_64 (リトルエンディアン)",
+        0xcffaedfe => "MH_CIGAM_64 (ビッグエンディアン)",
+        0xfeedface => "MH_MAGIC (リトルエンディアン)",
+        0xcefaedfe => "MH_CIGAM (ビッグエンディアン)",
         _ => "不明",
     };
     println!("マジックナンバー: {} (0x{:08x})", magic_str, header.magic);
