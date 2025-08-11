@@ -1,5 +1,5 @@
 ---
 triple:          'x86_64-apple-darwin'
-binary-path:     a.out
+binary-path:     test_dwarf5
 relocations:     []
 ...

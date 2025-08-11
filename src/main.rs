@@ -231,7 +231,10 @@ fn main() -> io::Result<()> {
         println!("  --debug-abbrev: __debug_abbrevセクションを解析 (DWARF 2-5対応)");
         println!("  --debug-aranges: __debug_arangesセクションを解析 (DWARF 2-5対応)");
         println!("  --debug-line: __debug_lineセクションを解析 (DWARF 2-5対応)");
-        println!("  --debug-str-offsets: __debug_str_offsetsセクションを解析 (DWARF 5)");
+        println!("  --debug-str: __debug_strセクションを表示 (DWARF 2-5)");
+        println!("  --debug-str-hex: __debug_strセクションを16進ダンプ (DWARF 2-5)");
+        println!("  --debug-str-offsets: __debug_str_offs__DWARFセクションを解析 (DWARF 5)");
+        println!("  --debug-str-offsets-hex: __debug_str_offs__DWARFセクションを16進ダンプ (DWARF 5)");
         println!("  --debug-addr: __debug_addrセクションを解析 (DWARF 5)");
         println!("  --apple-names: __apple_namesセクションを16進ダンプ表示");
         println!("  --stubs: __stubsセクションを16進ダンプ表示");
@@ -355,7 +358,7 @@ fn main() -> io::Result<()> {
             let owned_sections: Vec<SectionInfo> = data_sections.into_iter().cloned().collect();
             dump_data_sections(&actual_buffer, &owned_sections);
         },
-        "--debug-info" | "--debug-abbrev" | "--debug-aranges" | "--debug-line" | "--debug-str-offsets" | "--debug-addr" => {
+        "--debug-info" | "--debug-abbrev" | "--debug-aranges" | "--debug-line" | "--debug-str" | "--debug-str-hex" | "--debug-str-offsets" | "--debug-str-offsets-hex" | "--debug-addr" => {
             let endian = LittleEndian;
 
             // デバッグ情報の有無を確認し、必要に応じてdSYMファイルから読み込み
@@ -396,16 +399,18 @@ fn main() -> io::Result<()> {
             let debug_aranges_data = get_section_data("__debug_aranges");
             
             // DWARF 5の新しいセクション
-            let _debug_str_offsets_data = get_section_data("__debug_str_offsets");
-            let _debug_addr_data = get_section_data("__debug_addr");
+            let debug_str_offsets_data = get_section_data("__debug_str_offs__DWARF");
+            let debug_addr_data = get_section_data("__debug_addr");
             let debug_line_str_data = get_section_data("__debug_line_str");
 
             let debug_info = DebugInfo::new(&debug_info_data, endian);
             let debug_abbrev = DebugAbbrev::new(&debug_abbrev_data, endian);
             let _debug_line = DebugLine::new(&debug_line_data, endian);
             let debug_str = DebugStr::new(&debug_str_data, endian);
+            let debug_str_offsets = gimli::DebugStrOffsets::from(gimli::EndianSlice::new(&debug_str_offsets_data, endian));
+            let debug_addr = gimli::DebugAddr::from(gimli::EndianSlice::new(&debug_addr_data, endian));
             let _debug_aranges = gimli::DebugAranges::new(&debug_aranges_data, endian);
-            let _debug_line_str = gimli::DebugLineStr::new(&debug_line_str_data, endian);
+            let debug_line_str = gimli::DebugLineStr::new(&debug_line_str_data, endian);
 
             // __TEXTセグメントのベースアドレスを取得
             let text_base_addr = find_all_sections_in_segment(&debug_sections, "__TEXT")
@@ -416,7 +421,7 @@ fn main() -> io::Result<()> {
 
             let result = match command.as_str() {
                 "--debug-info" => {
-                    parse_and_display_debug_info(debug_info, debug_abbrev, debug_str, text_base_addr)
+                    parse_and_display_debug_info(debug_info, debug_abbrev, debug_str, debug_str_offsets, debug_addr, debug_line_str, text_base_addr, &debug_buffer, &debug_sections)
                 }
                 "--debug-abbrev" => {
                     if let Some(section) = find_section_by_name(&debug_sections, "__debug_abbrev") {
@@ -443,11 +448,35 @@ fn main() -> io::Result<()> {
                     display_debug_line_details_manual(&debug_buffer, &debug_sections);
                     Ok(())
                 }
+                "--debug-str" => {
+                    if let Some(section) = find_section_by_name(&debug_sections, "__debug_str") {
+                        display_debug_str(&debug_buffer, section);
+                    } else {
+                        println!("__debug_strセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                "--debug-str-hex" => {
+                    if let Some(section) = find_section_by_name(&debug_sections, "__debug_str") {
+                        display_debug_str_hexdump(&debug_buffer, section);
+                    } else {
+                        println!("__debug_strセクションが見つかりません");
+                    }
+                    Ok(())
+                }
                 "--debug-str-offsets" => {
-                    if let Some(section) = find_section_by_name(&debug_sections, "__debug_str_offsets") {
+                    if let Some(section) = find_section_by_name(&debug_sections, "__debug_str_offs__DWARF") {
                         parse_and_display_debug_str_offsets(&debug_buffer, section);
                     } else {
-                        println!("__debug_str_offsetsセクションが見つかりません");
+                        println!("__debug_str_offs__DWARFセクションが見つかりません");
+                    }
+                    Ok(())
+                }
+                "--debug-str-offsets-hex" => {
+                    if let Some(section) = find_section_by_name(&debug_sections, "__debug_str_offs__DWARF") {
+                        display_debug_str_offsets_hexdump(&debug_buffer, section);
+                    } else {
+                        println!("__debug_str_offs__DWARFセクションが見つかりません");
                     }
                     Ok(())
                 }
@@ -601,12 +630,29 @@ fn parse_and_display_debug_info<R: Reader>(
     debug_info: DebugInfo<R>,
     debug_abbrev: DebugAbbrev<R>,
     debug_str: DebugStr<R>,
+    debug_str_offsets: gimli::DebugStrOffsets<R>,
+    debug_addr: gimli::DebugAddr<R>,
+    debug_line_str: gimli::DebugLineStr<R>,
     text_base_addr: u64,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
 ) -> Result<(), Box<dyn Error>> {
+
+    
     let mut units = debug_info.units();
+    let mut previous_dwarf_version: Option<u16> = None;
+    
     while let Some(unit) = units.next()? {
         let abbrevs = unit.abbreviations(&debug_abbrev)?;
         let dwarf_version = unit.version();
+        
+        // DWARFバージョンの変更を検出・報告
+        if let Some(prev_version) = previous_dwarf_version {
+            if prev_version != dwarf_version {
+                println!("⚠️  DWARFバージョンが変更されました: {} → {}", prev_version, dwarf_version);
+            }
+        }
+        previous_dwarf_version = Some(dwarf_version);
         
         // バージョン別の機能説明を表示
         let version_features = match dwarf_version {
@@ -630,56 +676,107 @@ fn parse_and_display_debug_info<R: Reader>(
             let tag_name = get_die_tag_name(entry.tag().0 as u64, dwarf_version);
             println!("      TAG: {}", tag_name);
 
-            // DW_TAG_compile_unitの場合は特別な処理を行う
+            // タグ別の特別な処理を行う
             let is_compile_unit = entry.tag() == gimli::DW_TAG_compile_unit;
+            let is_subprogram = entry.tag() == gimli::DW_TAG_subprogram;
+            let is_variable = entry.tag() == gimli::DW_TAG_variable;
+            let is_formal_parameter = entry.tag() == gimli::DW_TAG_formal_parameter;
+            let is_typedef = entry.tag() == gimli::DW_TAG_typedef;
+            let is_structure_type = entry.tag() == gimli::DW_TAG_structure_type;
+            let is_class_type = entry.tag() == gimli::DW_TAG_class_type;
+            
             let mut low_pc: Option<u64> = None;
             let mut high_pc_value: Option<gimli::AttributeValue<R>> = None;
             let mut high_pc_attr_name: Option<gimli::DwAt> = None;
+            let mut ranges_attr: Option<gimli::AttributeValue<R>> = None;
+            let mut name_attr: Option<String> = None;
+            let mut type_attr: Option<String> = None;
 
             let mut attrs = entry.attrs();
             while let Some(attr) = attrs.next()? {
                 let attr_name = get_attr_name(attr.name().0 as u64);
                 
-                // DW_AT_low_pcとDW_AT_high_pcを記録
-                if is_compile_unit {
-                    if attr.name() == gimli::DW_AT_low_pc {
-                        match attr.value() {
-                            gimli::AttributeValue::Addr(addr) => {
-                                // アドレスが相対的な場合はベースアドレスを加算
-                                low_pc = Some(if addr < 0x100000000 { addr + text_base_addr } else { addr });
-                            },
-                            gimli::AttributeValue::Udata(offset) => {
-                                low_pc = Some(offset + text_base_addr);
-                            },
-                            gimli::AttributeValue::Data4(offset) => {
-                                low_pc = Some(offset as u64 + text_base_addr);
-                            },
-                            gimli::AttributeValue::Data8(offset) => {
-                                low_pc = Some(offset + text_base_addr);
-                            },
-                            _ => {}
+                // 重要な属性を記録（すべてのタグで）
+                if attr.name() == gimli::DW_AT_low_pc && (is_compile_unit || is_subprogram) {
+                    match attr.value() {
+                        gimli::AttributeValue::Addr(addr) => {
+                            // アドレスが相対的な場合はベースアドレスを加算
+                            low_pc = Some(if addr < 0x100000000 { addr + text_base_addr } else { addr });
+                        },
+                        gimli::AttributeValue::Udata(offset) => {
+                            low_pc = Some(offset + text_base_addr);
+                        },
+                        gimli::AttributeValue::Data4(offset) => {
+                            low_pc = Some(offset as u64 + text_base_addr);
+                        },
+                        gimli::AttributeValue::Data8(offset) => {
+                            low_pc = Some(offset + text_base_addr);
+                        },
+                        gimli::AttributeValue::DebugAddrIndex(index) => {
+                            // DWARF5のアドレスインデックスを解決
+                            if let Ok(resolved_addr) = get_addr_from_index::<R>(index, debug_buffer, debug_sections) {
+                                low_pc = Some(resolved_addr);
+                            }
+                        },
+                        _ => {}
+                    }
+                } else if attr.name() == gimli::DW_AT_high_pc && (is_compile_unit || is_subprogram) {
+                    high_pc_value = Some(attr.value());
+                    high_pc_attr_name = Some(attr.name());
+                } else if attr.name() == gimli::DW_AT_ranges && (is_compile_unit || is_subprogram) {
+                    ranges_attr = Some(attr.value());
+                } else if attr.name() == gimli::DW_AT_name {
+                    // 名前属性を記録（すべてのタグで）
+                    if dwarf_version >= 5 {
+                        if let Ok(val_str) = dwarf_attr_to_string_with_dwarf5(attr.value(), &debug_str, &debug_str_offsets, &debug_addr, &debug_line_str, &unit, debug_buffer, debug_sections, &debug_info, &debug_abbrev) {
+                            name_attr = Some(val_str);
                         }
-                    } else if attr.name() == gimli::DW_AT_high_pc {
-                        high_pc_value = Some(attr.value());
-                        high_pc_attr_name = Some(attr.name());
+                    } else {
+                        if let Ok(val_str) = dwarf_attr_to_string_with_unit_resolution(attr.value(), &debug_str, &debug_info, &debug_abbrev) {
+                            name_attr = Some(val_str);
+                        }
+                    }
+                } else if attr.name() == gimli::DW_AT_type {
+                    // 型属性を記録（変数、パラメータ、typedefなどで）
+                    if dwarf_version >= 5 {
+                        if let Ok(val_str) = dwarf_attr_to_string_with_dwarf5(attr.value(), &debug_str, &debug_str_offsets, &debug_addr, &debug_line_str, &unit, debug_buffer, debug_sections, &debug_info, &debug_abbrev) {
+                            type_attr = Some(val_str);
+                        }
+                    } else {
+                        if let Ok(val_str) = dwarf_attr_to_string_with_unit_resolution(attr.value(), &debug_str, &debug_info, &debug_abbrev) {
+                            type_attr = Some(val_str);
+                        }
                     }
                 }
 
                 // DW_AT_high_pcは後で特別処理するのでここではスキップ
                 if !(is_compile_unit && attr.name() == gimli::DW_AT_high_pc) {
                     print!("        ATTR: {} ", attr_name);
-                    // ユニット参照を解決できるバージョンを使用
-                    if let Ok(val_str) = dwarf_attr_to_string_with_unit_resolution(attr.value(), &debug_str, &debug_info, &debug_abbrev) {
-                        println!("({})", val_str);
-                    } else if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(attr.name(), attr.value(), &debug_str, text_base_addr) {
-                        println!("({})", val_str);
+                    // DWARF5の場合は新しい文字列抽出機能を使用
+                    if dwarf_version >= 5 {
+                        if let Ok(val_str) = dwarf_attr_to_string_with_dwarf5(attr.value(), &debug_str, &debug_str_offsets, &debug_addr, &debug_line_str, &unit, debug_buffer, debug_sections, &debug_info, &debug_abbrev) {
+                            println!("({})", val_str);
+                        } else if let Ok(val_str) = dwarf_attr_to_string_with_unit_resolution(attr.value(), &debug_str, &debug_info, &debug_abbrev) {
+                            println!("({})", val_str);
+                        } else if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(attr.name(), attr.value(), &debug_str, text_base_addr) {
+                            println!("({})", val_str);
+                        } else {
+                            println!("(unhandled format)");
+                        }
                     } else {
-                        println!("(unhandled format)");
+                        // DWARF4以前の処理
+                        if let Ok(val_str) = dwarf_attr_to_string_with_unit_resolution(attr.value(), &debug_str, &debug_info, &debug_abbrev) {
+                            println!("({})", val_str);
+                        } else if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(attr.name(), attr.value(), &debug_str, text_base_addr) {
+                            println!("({})", val_str);
+                        } else {
+                            println!("(unhandled format)");
+                        }
                     }
                 }
             }
 
-            // DW_TAG_compile_unitでDW_AT_high_pcが見つからない場合、追加情報を表示
+            // タグ別の特別な処理と追加情報表示
             if is_compile_unit {
                 if let (Some(low), Some(high_val), Some(_)) = (low_pc, high_pc_value, high_pc_attr_name) {
                     match high_val {
@@ -704,8 +801,94 @@ fn parse_and_display_debug_info<R: Reader>(
                             }
                         }
                     }
-                } else if low_pc.is_some() {
-                    println!("        注意: DW_AT_low_pcは存在しますが、DW_AT_high_pcが見つかりません");
+                } else if let Some(low) = low_pc {
+                    // DW_AT_high_pcが存在しない場合の詳細情報（DWARF5でよくある）
+                    println!("        INFO: DW_AT_high_pc属性が存在しません (low_pc=0x{:x})", low);
+                    if dwarf_version >= 5 {
+                        println!("        INFO: DWARF5では DW_AT_ranges 属性でアドレス範囲を定義することが一般的です");
+                    } else {
+                        println!("        INFO: DWARF{}でDW_AT_high_pcが欠如しています - 不完全なデバッグ情報の可能性", dwarf_version);
+                    }
+                }
+                
+                // DW_AT_ranges属性の情報表示
+                if let Some(ranges_val) = ranges_attr {
+                    match ranges_val {
+                        gimli::AttributeValue::RangeListsRef(offset) => {
+                            println!("        INFO: DW_AT_ranges属性が存在します (offset: 0x{:x}) - __debug_ranges/__debug_rnglists参照", offset.0.into_u64());
+                        },
+                        gimli::AttributeValue::SecOffset(offset) => {
+                            println!("        INFO: DW_AT_ranges属性が存在します (sec_offset: 0x{:x}) - __debug_ranges参照", offset.into_u64());
+                        },
+                        _ => {
+                            if let Ok(val_str) = dwarf_attr_to_string_with_context_and_base(gimli::DW_AT_ranges, ranges_val, &debug_str, text_base_addr) {
+                                println!("        INFO: DW_AT_ranges属性が存在します ({})", val_str);
+                            }
+                        }
+                    }
+                }
+            } else if is_subprogram {
+                // DW_TAG_subprogram（関数）の特別処理
+                if let Some(name) = &name_attr {
+                    println!("        関数名: {}", name);
+                }
+                if let (Some(low), Some(high_val), Some(_)) = (low_pc, high_pc_value, high_pc_attr_name) {
+                    match high_val {
+                        gimli::AttributeValue::Addr(addr) => {
+                            println!("        関数範囲: 0x{:x} - 0x{:x} (サイズ: {} バイト)", low, addr, addr - low);
+                        },
+                        gimli::AttributeValue::Udata(offset) => {
+                            let high_addr = low + offset;
+                            println!("        関数範囲: 0x{:x} - 0x{:x} (サイズ: {} バイト)", low, high_addr, offset);
+                        },
+                        gimli::AttributeValue::Data4(offset) => {
+                            let high_addr = low + offset as u64;
+                            println!("        関数範囲: 0x{:x} - 0x{:x} (サイズ: {} バイト)", low, high_addr, offset);
+                        },
+                        _ => {}
+                    }
+                }
+            } else if is_variable {
+                // DW_TAG_variable（変数）の特別処理
+                if let Some(name) = &name_attr {
+                    if let Some(type_info) = &type_attr {
+                        println!("        変数: {} (型: {})", name, type_info);
+                    } else {
+                        println!("        変数: {}", name);
+                    }
+                }
+            } else if is_formal_parameter {
+                // DW_TAG_formal_parameter（関数パラメータ）の特別処理
+                if let Some(name) = &name_attr {
+                    if let Some(type_info) = &type_attr {
+                        println!("        パラメータ: {} (型: {})", name, type_info);
+                    } else {
+                        println!("        パラメータ: {}", name);
+                    }
+                }
+            } else if is_typedef {
+                // DW_TAG_typedef（型定義）の特別処理
+                if let Some(name) = &name_attr {
+                    if let Some(type_info) = &type_attr {
+                        println!("        型定義: {} = {}", name, type_info);
+                    } else {
+                        println!("        型定義: {}", name);
+                    }
+                }
+            } else if is_structure_type || is_class_type {
+                // DW_TAG_structure_type / DW_TAG_class_type（構造体/クラス）の特別処理
+                let type_name = if is_structure_type { "構造体" } else { "クラス" };
+                if let Some(name) = &name_attr {
+                    println!("        {}: {}", type_name, name);
+                } else {
+                    println!("        {} (無名)", type_name);
+                }
+            }
+            
+            // DWARF5特有の属性情報を表示
+            if dwarf_version >= 5 {
+                if name_attr.is_some() || type_attr.is_some() {
+                    println!("        [DWARF5 文字列抽出機能適用済み]");
                 }
             }
         }
@@ -713,65 +896,435 @@ fn parse_and_display_debug_info<R: Reader>(
     Ok(())
 }
 
-// ユニット参照を解決する関数（具体的表示版）
-fn resolve_unit_ref<R: Reader>(
-    unit_ref: gimli::UnitOffset<R::Offset>,
-    _debug_info: &DebugInfo<R>,
-    _debug_abbrev: &DebugAbbrev<R>,
-    _debug_str: &DebugStr<R>,
-) -> Result<String, Box<dyn Error>> {
-    let offset_value = unit_ref.0.into_u64();
-    
-    // オフセット値に基づいて具体的な型情報を推測して表示
-    let mut result = format!("UnitOffset(0x{:x}) -> ", offset_value);
-    
-    // オフセット値と一般的なDWARFレイアウトから具体的な型を推測
-    let (type_info, details) = match offset_value {
-        0x1b => ("基本型", "名前=\"void\", サイズ=0バイト"),
-        0x22 => ("基本型", "名前=\"char\", サイズ=1バイト, エンコーディング=signed_char"),
-        0x29 => ("基本型", "名前=\"signed char\", サイズ=1バイト, エンコーディング=signed_char"),
-        0x30 => ("基本型", "名前=\"unsigned char\", サイズ=1バイト, エンコーディング=unsigned_char"),
-        0x37 => ("基本型", "名前=\"short\", サイズ=2バイト, エンコーディング=signed"),
-        0x3e => ("基本型", "名前=\"unsigned short\", サイズ=2バイト, エンコーディング=unsigned"),
-        0x45 => ("基本型", "名前=\"int\", サイズ=4バイト, エンコーディング=signed"),
-        0x4c => ("基本型", "名前=\"unsigned int\", サイズ=4バイト, エンコーディング=unsigned"),
-        0x53 => ("基本型", "名前=\"long\", サイズ=8バイト, エンコーディング=signed"),
-        0x5a => ("基本型", "名前=\"unsigned long\", サイズ=8バイト, エンコーディング=unsigned"),
-        0x61 => ("基本型", "名前=\"long long\", サイズ=8バイト, エンコーディング=signed"),
-        0x68 => ("基本型", "名前=\"unsigned long long\", サイズ=8バイト, エンコーディング=unsigned"),
-        0x6f => ("基本型", "名前=\"float\", サイズ=4バイト, エンコーディング=float"),
-        0x76 => ("基本型", "名前=\"double\", サイズ=8バイト, エンコーディング=float"),
-        0x7d => ("基本型", "名前=\"long double\", サイズ=16バイト, エンコーディング=float"),
-        0x84..=0x100 => ("ポインタ型", "サイズ=8バイト, 対象型=基本型"),
-        0x101..=0x200 => ("構造体", "複数のメンバ変数を含む"),
-        0x201..=0x300 => ("配列型", "要素型への参照"),
-        0x301..=0x400 => ("関数型", "戻り値型と引数型を定義"),
-        0x401..=0x500 => ("typedef", "既存型のエイリアス"),
-        _ => {
-            if offset_value < 0x100 {
-                ("基本型", "プリミティブ型")
-            } else if offset_value < 0x500 {
-                ("複合型", "構造体、クラス、または配列")
-            } else {
-                ("高次型", "関数、テンプレート、または特殊型")
+// DWARF5文字列オフセットテーブルの独自実装構造体
+#[derive(Debug)]
+struct CustomStrOffsetsTable {
+    unit_length: u32,
+    version: u16,
+    padding: u16,
+    offsets: Vec<u32>,
+}
+
+impl CustomStrOffsetsTable {
+    // __debug_str_offs__DWARFセクションから独自パース
+    fn parse_from_section(section_data: &[u8]) -> Result<Self, String> {
+        if section_data.len() < 8 {
+            return Err("セクションサイズが小さすぎます".to_string());
+        }
+        
+        // ヘッダー解析
+        let unit_length = u32::from_le_bytes([
+            section_data[0], section_data[1], section_data[2], section_data[3]
+        ]);
+        let version = u16::from_le_bytes([section_data[4], section_data[5]]);
+        let padding = u16::from_le_bytes([section_data[6], section_data[7]]);
+        
+        // オフセットテーブル解析（8バイト以降）
+        let mut offsets = Vec::new();
+        let offset_data = &section_data[8..];
+        
+        for chunk in offset_data.chunks(4) {
+            if chunk.len() == 4 {
+                let offset = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                offsets.push(offset);
             }
         }
+        
+        Ok(CustomStrOffsetsTable {
+            unit_length,
+            version,
+            padding,
+            offsets,
+        })
+    }
+    
+    // インデックスから文字列オフセットを取得
+    fn get_string_offset(&self, index: usize) -> Option<u32> {
+        self.offsets.get(index).copied()
+    }
+}
+
+// DWARF5行番号情報の独自解決関数
+fn try_resolve_debug_line_with_data<R: Reader>(
+    line_ref: gimli::DebugLineOffset<R::Offset>,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
+) -> Result<String, String> {
+    let offset_value = line_ref.0.into_u64() as usize;
+    
+    // __debug_lineセクションを取得
+    let line_section = match find_section_by_name(debug_sections, "__debug_line") {
+        Some(section) => section,
+        None => return Err("__debug_lineセクションが見つかりません".to_string()),
     };
     
-    result.push_str(type_info);
-    result.push_str(&format!(" ({})", details));
+    // セクションデータを抽出（オフセット検証付き）
+    let start_offset = line_section.offset as usize;
+    let section_size = line_section.size as usize;
     
-    // 見つからない場合はオフセット値から推測
-    let reference_type = match offset_value {
-        0..=50 => "基本型 (int, char等)",
-        51..=100 => "基本型 (long, double等)",
-        101..=200 => "ポインタ型または参照型",
-        201..=500 => "構造体またはクラス",
-        501..=1000 => "関数または大きな構造体",
-        _ => "複合型または配列",
+    // DWARF5オフセット検証: デバッグ情報を追加
+    if start_offset >= debug_buffer.len() || section_size == 0 {
+        return Err(format!("セクションデータが無効です (offset: 0x{:x}, size: {}, buffer_len: {})", 
+                          start_offset, section_size, debug_buffer.len()));
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, debug_buffer.len());
+    let section_data = &debug_buffer[start_offset..actual_end];
+    
+    // DWARF5オフセット検証: セクションデータの整合性をチェック
+    if section_data.len() != section_size && actual_end == debug_buffer.len() {
+        eprintln!("⚠️  __debug_lineセクションが切り詰められました: 期待サイズ={}, 実際サイズ={}", 
+                 section_size, section_data.len());
+    }
+    
+    // 指定されたオフセットが有効範囲内かチェック
+    if offset_value >= section_data.len() {
+        return Err(format!("オフセット0x{:x}が範囲外です (セクションサイズ: {})", offset_value, section_data.len()));
+    }
+    
+    // DWARF5の行番号テーブルヘッダーを簡易解析
+    let header_data = &section_data[offset_value..];
+    if header_data.len() < 12 {
+        return Err("行番号テーブルヘッダーが不完全です".to_string());
+    }
+    
+    // 行番号テーブルの長さ（最初の4バイト）
+    let unit_length = u32::from_le_bytes([header_data[0], header_data[1], header_data[2], header_data[3]]);
+    
+    // DWARF形式（次の2バイト）
+    let version = u16::from_le_bytes([header_data[4], header_data[5]]);
+    
+    // ヘッダー長（次の4バイト、DWARF5では8バイト）
+    let header_length = if version >= 5 {
+        // DWARF5では8バイトのヘッダー長
+        if header_data.len() < 16 {
+            return Err("DWARF5行番号ヘッダーが不完全です".to_string());
+        }
+        u64::from_le_bytes([
+            header_data[6], header_data[7], header_data[8], header_data[9],
+            header_data[10], header_data[11], header_data[12], header_data[13]
+        ])
+    } else {
+        u32::from_le_bytes([header_data[6], header_data[7], header_data[8], header_data[9]]) as u64
     };
     
-    Ok(format!("UnitOffset(0x{:x}) -> [推測: {}]", offset_value, reference_type))
+    Ok(format!("0x{:x} (.debug_line: unit_length={}, version={}, header_length={})", 
+              offset_value, unit_length, version, header_length))
+}
+
+// DWARF5アドレスインデックスの独自解決関数
+fn try_resolve_addr_index_with_data<R: Reader>(
+    index: gimli::DebugAddrIndex<R::Offset>,
+    _unit: &gimli::UnitHeader<R>,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
+) -> Result<String, String> {
+    let index_value = index.0.into_u64() as usize;
+    
+    // __debug_addrセクションを取得
+    let addr_section = match find_section_by_name(debug_sections, "__debug_addr") {
+        Some(section) => section,
+        None => return Err("__debug_addrセクションが見つかりません".to_string()),
+    };
+    
+    // セクションデータを抽出（オフセット検証付き）
+    let start_offset = addr_section.offset as usize;
+    let section_size = addr_section.size as usize;
+    
+    // DWARF5オフセット検証: デバッグ情報を追加
+    if start_offset >= debug_buffer.len() || section_size == 0 {
+        return Err(format!("セクションデータが無効です (offset: 0x{:x}, size: {}, buffer_len: {})", 
+                          start_offset, section_size, debug_buffer.len()));
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, debug_buffer.len());
+    let section_data = &debug_buffer[start_offset..actual_end];
+    
+    // DWARF5オフセット検証: セクションデータの整合性をチェック
+    if section_data.len() != section_size && actual_end == debug_buffer.len() {
+        eprintln!("⚠️  __debug_addrセクションが切り詰められました: 期待サイズ={}, 実際サイズ={}", 
+                 section_size, section_data.len());
+    }
+    
+    // DWARF5デバッグ情報: セクション情報を表示（初回のみ）
+    static mut ADDR_SECTION_INFO_SHOWN: bool = false;
+    unsafe {
+        if !ADDR_SECTION_INFO_SHOWN {
+            eprintln!("🔍 __debug_addrセクション情報: offset=0x{:x}, size={}, 利用可能アドレス数={}", 
+                     start_offset, section_size, section_data.len() / 8);
+            ADDR_SECTION_INFO_SHOWN = true;
+        }
+    }
+    
+    // アドレステーブルから指定されたインデックスのアドレスを取得
+    // DWARF5のアドレステーブルは通常8バイトのアドレスエントリの配列
+    let address_size = 8; // 64ビットアドレス
+    let required_offset = index_value * address_size;
+    
+    // DWARF5オフセット検証: アドレス計算の詳細チェック
+    if required_offset + address_size > section_data.len() {
+        return Err(format!("インデックス{}が範囲外です (required_offset: 0x{:x}, address_size: {}, section_size: {})", 
+                          index_value, required_offset, address_size, section_data.len()));
+    }
+    
+    // DWARF5オフセット検証: アドレステーブルの構造チェック
+    if section_data.len() % address_size != 0 {
+        eprintln!("⚠️  __debug_addrセクションサイズがアドレスサイズの倍数ではありません: {} % {} = {}", 
+                 section_data.len(), address_size, section_data.len() % address_size);
+    }
+    
+    // 8バイトのアドレス値を読み取り（リトルエンディアン）
+    let mut addr_bytes = [0u8; 8];
+    addr_bytes.copy_from_slice(&section_data[required_offset..required_offset + address_size]);
+    let address = u64::from_le_bytes(addr_bytes);
+    
+    Ok(format!("0x{:x}", address))
+}
+
+// UnitRef参照解決関数
+fn resolve_unit_ref<R: Reader>(
+    unit_ref: gimli::UnitOffset<R::Offset>,
+    debug_info: &DebugInfo<R>,
+    debug_abbrev: &DebugAbbrev<R>,
+    debug_str: &DebugStr<R>,
+) -> Result<String, Box<dyn Error>> {
+    // 現在のユニットを取得
+    let mut units = debug_info.units();
+    while let Some(unit) = units.next()? {
+        let abbrevs = unit.abbreviations(debug_abbrev)?;
+        
+        // 指定されたオフセットのエントリを検索
+        let mut entries = unit.entries(&abbrevs);
+        while let Some((_, entry)) = entries.next_dfs()? {
+            if entry.offset() == unit_ref {
+                // 参照先のDIEを見つけた
+                let tag_name = get_die_tag_name(entry.tag().0 as u64, unit.version());
+                
+                // 名前属性を取得
+                let mut name = None;
+                let mut type_name = None;
+                
+                let mut attrs = entry.attrs();
+                while let Some(attr) = attrs.next()? {
+                    if attr.name() == gimli::DW_AT_name {
+                        match attr.value() {
+                            gimli::AttributeValue::String(s) => {
+                                name = Some(s.to_string_lossy()?.into_owned());
+                            },
+                            gimli::AttributeValue::DebugStrRef(offset) => {
+                                if let Ok(s) = debug_str.get_str(offset) {
+                                    name = Some(s.to_string_lossy()?.into_owned());
+                                }
+                            },
+                            _ => {}
+                        }
+                    } else if attr.name() == gimli::DW_AT_type {
+                        type_name = Some(format!("{:?}", attr.value()));
+                    }
+                }
+                
+                // 結果を構築
+                let mut result = format!("{}", tag_name);
+                if let Some(n) = name {
+                    result.push_str(&format!(" \"{}\"", n));
+                }
+                if let Some(t) = type_name {
+                    result.push_str(&format!(" (type: {})", t));
+                }
+                
+                return Ok(result);
+            }
+        }
+    }
+    
+    Err("参照先のDIEが見つかりません".into())
+}
+
+// DWARF5アドレスインデックスから実際のアドレス値を取得する関数
+fn get_addr_from_index<R: Reader>(
+    index: gimli::DebugAddrIndex<R::Offset>,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
+) -> Result<u64, String> {
+    let index_value = index.0.into_u64() as usize;
+    
+    // __debug_addrセクションを取得
+    let addr_section = match find_section_by_name(debug_sections, "__debug_addr") {
+        Some(section) => section,
+        None => return Err("__debug_addrセクションが見つかりません".to_string()),
+    };
+    
+    // セクションデータを抽出
+    let start_offset = addr_section.offset as usize;
+    let section_size = addr_section.size as usize;
+    
+    if start_offset >= debug_buffer.len() || section_size == 0 {
+        return Err(format!("セクションデータが無効です (offset: 0x{:x}, size: {}, buffer_len: {})", 
+                          start_offset, section_size, debug_buffer.len()));
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, debug_buffer.len());
+    let section_data = &debug_buffer[start_offset..actual_end];
+    
+    // アドレステーブルから指定されたインデックスのアドレスを取得
+    let address_size = 8; // 64ビットアドレス
+    let required_offset = index_value * address_size;
+    
+    if required_offset + address_size > section_data.len() {
+        return Err(format!("インデックス{}が範囲外です", index_value));
+    }
+    
+    // 8バイトのアドレス値を読み取り（リトルエンディアン）
+    let mut addr_bytes = [0u8; 8];
+    addr_bytes.copy_from_slice(&section_data[required_offset..required_offset + address_size]);
+    let address = u64::from_le_bytes(addr_bytes);
+    
+    Ok(address)
+}
+
+// DWARF5文字列オフセットインデックスの独自解決関数
+fn try_resolve_str_offsets_index_with_data<R: Reader>(
+    debug_str: &DebugStr<R>,
+    index: gimli::DebugStrOffsetsIndex<R::Offset>,
+    _unit: &gimli::UnitHeader<R>,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
+) -> Result<String, String> {
+    // 独自実装による文字列インデックス解決
+    let index_value = index.0.into_u64() as usize;
+    
+    // __debug_str_offs__DWARFセクションを取得
+    let str_offsets_section = match find_section_by_name(debug_sections, "__debug_str_offs__DWARF") {
+        Some(section) => section,
+        None => return Err("__debug_str_offs__DWARFセクションが見つかりません".to_string()),
+    };
+    
+    // セクションデータを抽出（オフセット検証付き）
+    let start_offset = str_offsets_section.offset as usize;
+    let section_size = str_offsets_section.size as usize;
+    
+    // DWARF5オフセット検証: デバッグ情報を追加
+    if start_offset >= debug_buffer.len() || section_size == 0 {
+        return Err(format!("セクションデータが無効です (offset: 0x{:x}, size: {}, buffer_len: {})", 
+                          start_offset, section_size, debug_buffer.len()));
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, debug_buffer.len());
+    let section_data = &debug_buffer[start_offset..actual_end];
+    
+    // DWARF5オフセット検証: セクションデータの整合性をチェック
+    if section_data.len() != section_size && actual_end == debug_buffer.len() {
+        eprintln!("⚠️  __debug_str_offs__DWARFセクションが切り詰められました: 期待サイズ={}, 実際サイズ={}", 
+                 section_size, section_data.len());
+    }
+    
+    // DWARF5デバッグ情報: セクション情報を表示（初回のみ）
+    static mut STR_OFFSETS_SECTION_INFO_SHOWN: bool = false;
+    unsafe {
+        if !STR_OFFSETS_SECTION_INFO_SHOWN {
+            eprintln!("🔍 __debug_str_offs__DWARFセクション情報: offset=0x{:x}, size={}", 
+                     start_offset, section_size);
+            STR_OFFSETS_SECTION_INFO_SHOWN = true;
+        }
+    }
+    
+    // 独自実装でオフセットテーブルをパース
+    let str_offsets_table = match CustomStrOffsetsTable::parse_from_section(section_data) {
+        Ok(table) => table,
+        Err(e) => return Err(format!("オフセットテーブル解析失敗: {}", e)),
+    };
+    
+    // インデックスから文字列オフセットを取得
+    let string_offset = match str_offsets_table.get_string_offset(index_value) {
+        Some(offset) => offset,
+        None => return Err(format!("インデックス{}が範囲外です (最大: {})", index_value, str_offsets_table.offsets.len())),
+    };
+    
+    // 文字列オフセットから実際の文字列を取得
+    // gimliの型システムに合わせてオフセットを作成
+    let str_offset = gimli::DebugStrOffset(R::Offset::from_u64(string_offset as u64).map_err(|_| "オフセット変換失敗")?);
+    match debug_str.get_str(str_offset) {
+        Ok(s) => {
+            match s.to_string_lossy() {
+                Ok(owned_string) => Ok(format!("{:?}", owned_string.into_owned())),
+                Err(_) => Err(format!("文字列変換失敗 (offset: 0x{:x})", string_offset)),
+            }
+        },
+        Err(_) => Err(format!("文字列取得失敗 (offset: 0x{:x})", string_offset)),
+    }
+}
+
+// 後方互換性のための関数（現在は使用されない）
+fn try_resolve_str_offsets_index<R: Reader>(
+    _debug_str_offsets: &gimli::DebugStrOffsets<R>,
+    _debug_str: &DebugStr<R>,
+    index: gimli::DebugStrOffsetsIndex<R::Offset>,
+    unit: &gimli::UnitHeader<R>,
+) -> Result<String, String> {
+    let format_info = format!("{:?}", unit.format());
+    let version_info = unit.version();
+    let index_value = index.0.into_u64() as usize;
+    
+    Err(format!("独自実装準備完了 (DWARF{}, format: {}, index: {}) - セクションデータが必要", 
+               version_info, format_info, index_value))
+}
+
+// ユニット参照を解決する関数（具体的表示版）
+
+
+
+// DWARF5の文字列抽出を行う関数（実用版）
+fn dwarf_attr_to_string_with_dwarf5<R: Reader>(
+    val: gimli::AttributeValue<R>,
+    debug_str: &DebugStr<R>,
+    _debug_str_offsets: &gimli::DebugStrOffsets<R>,
+    _debug_addr: &gimli::DebugAddr<R>,
+    debug_line_str: &gimli::DebugLineStr<R>,
+    _unit: &gimli::UnitHeader<R>,
+    debug_buffer: &[u8],
+    debug_sections: &HashMap<String, SectionInfo>,
+    debug_info: &DebugInfo<R>,
+    debug_abbrev: &DebugAbbrev<R>,
+) -> Result<String, Box<dyn Error>> {
+    match val {
+        gimli::AttributeValue::DebugStrOffsetsIndex(index) => {
+            // DWARF5の文字列オフセットインデックス - 独自実装で解決
+            match try_resolve_str_offsets_index_with_data(debug_str, index, _unit, debug_buffer, debug_sections) {
+                Ok(resolved_string) => Ok(resolved_string),
+                Err(err_msg) => Ok(format!("str_offsets_index[{:?}] (DWARF5文字列インデックス - __debug_str_offs__DWARF解決: {})", 
+                                          index.0, err_msg))
+            }
+        },
+        gimli::AttributeValue::DebugAddrIndex(index) => {
+            // DWARF5のアドレスインデックス - 独自実装で解決
+            match try_resolve_addr_index_with_data(index, _unit, debug_buffer, debug_sections) {
+                Ok(resolved_addr) => Ok(resolved_addr),
+                Err(err_msg) => Ok(format!("addr_index[{:?}] (DWARF5アドレスインデックス - __debug_addr解決: {})", index.0, err_msg))
+            }
+        },
+        gimli::AttributeValue::DebugLineRef(line_ref) => {
+            // DWARF5の行番号情報 - 独自実装で解決
+            match try_resolve_debug_line_with_data::<R>(line_ref, debug_buffer, debug_sections) {
+                Ok(resolved_info) => Ok(resolved_info),
+                Err(err_msg) => Ok(format!("line_ref: 0x{:x} (__debug_line解決: {})", line_ref.0.into_u64(), err_msg))
+            }
+        },
+        gimli::AttributeValue::DebugLineStrRef(offset) => {
+            // .debug_line_strセクションから文字列を取得
+            match debug_line_str.get_str(offset) {
+                Ok(s) => Ok(format!("{:?}", s.to_string_lossy()?.into_owned())),
+                Err(_) => Ok(format!("line_str_ref[0x{:x}] (文字列取得失敗)", offset.0.into_u64()))
+            }
+        },
+        gimli::AttributeValue::UnitRef(unit_ref) => {
+            // DWARF5でも実際の参照解決を実行
+            match resolve_unit_ref(unit_ref, debug_info, debug_abbrev, debug_str) {
+                Ok(resolved) => Ok(resolved),
+                Err(_) => Ok(format!("unit_ref: UnitOffset(0x{:x}) -> [DWARF5参照解決失敗]", unit_ref.0.into_u64()))
+            }
+        },
+        _ => dwarf_attr_to_string(val, debug_str)
+    }
 }
 
 // ユニット参照を解決できるバージョンの属性値文字列化関数
@@ -829,6 +1382,16 @@ fn dwarf_attr_to_string<R: Reader>(
         gimli::AttributeValue::DebugStrRef(offset) => {
             format!("{:?}", debug_str.get_str(offset)?.to_string_lossy()?.into_owned())
         }
+        // DWARF5の新しい文字列フォーム対応
+        gimli::AttributeValue::DebugStrOffsetsIndex(index) => {
+            // str_offsets_indexの場合、可能であれば実際の文字列を取得を試行
+            // 失敗した場合はインデックス情報を表示
+            format!("str_offsets_index[{:?}] (DWARF5 - 文字列解決には__debug_str_offs__DWARFが必要)", index.0)
+        }
+        gimli::AttributeValue::DebugLineStrRef(offset) => {
+            // .debug_line_strセクションへの参照
+            format!("line_str_ref[0x{:x}] (DWARF5 line string)", offset.0.into_u64())
+        }
         gimli::AttributeValue::Udata(u) => format!("{}", u),
         gimli::AttributeValue::Sdata(s) => format!("{}", s),
         gimli::AttributeValue::Data1(d) => format!("0x{:x}", d),
@@ -842,7 +1405,7 @@ fn dwarf_attr_to_string<R: Reader>(
             format!("{} - {}", get_language_name(lang_code), get_language_description(lang_code))
         },
         gimli::AttributeValue::UnitRef(unit_ref) => {
-            format!("unit_ref: UnitOffset(0x{:x}) -> [参照解決機能を実装済み]", unit_ref.0.into_u64())
+            format!("unit_ref: UnitOffset(0x{:x}) -> [参照解決は dwarf_attr_to_string_with_unit_resolution で実装済み]", unit_ref.0.into_u64())
         },
         gimli::AttributeValue::DebugInfoRef(debug_info_ref) => format!("debug_info_ref: {:?}", debug_info_ref),
         gimli::AttributeValue::SecOffset(offset) => format!("sec_offset: {:?}", offset),
@@ -853,6 +1416,64 @@ fn dwarf_attr_to_string<R: Reader>(
         gimli::AttributeValue::Block(block) => {
             let slice = block.to_slice()?;
             format!("block: {} bytes", slice.len())
+        },
+        // DWARF5の追加フォーム対応
+        gimli::AttributeValue::DebugAddrIndex(index) => {
+            format!("addr_index[{:?}] (DWARF5 address index)", index.0)
+        },
+        gimli::AttributeValue::DebugLocListsIndex(index) => {
+            format!("loclists_index[{:?}] (DWARF5 location list index)", index.0)
+        },
+        gimli::AttributeValue::DebugRngListsIndex(index) => {
+            format!("rnglists_index[{:?}] (DWARF5 range list index)", index.0)
+        },
+        gimli::AttributeValue::DebugTypesRef(type_ref) => {
+            format!("types_ref: 0x{:x} (DWARF4 type reference)", type_ref.0.into_u64())
+        },
+        gimli::AttributeValue::DebugMacinfoRef(macinfo_ref) => {
+            format!("macinfo_ref: 0x{:x} (macro info reference)", macinfo_ref.0.into_u64())
+        },
+        gimli::AttributeValue::DebugMacroRef(macro_ref) => {
+            format!("macro_ref: 0x{:x} (DWARF5 macro reference)", macro_ref.0.into_u64())
+        },
+        gimli::AttributeValue::RangeListsRef(ranges_ref) => {
+            format!("ranges_ref: 0x{:x} (range list reference)", ranges_ref.0.into_u64())
+        },
+        gimli::AttributeValue::LocationListsRef(loc_ref) => {
+            format!("loc_ref: 0x{:x} (location list reference)", loc_ref.0.into_u64())
+        },
+        gimli::AttributeValue::Encoding(encoding) => {
+            format!("encoding: 0x{:x}", encoding.0)
+        },
+        gimli::AttributeValue::DecimalSign(sign) => {
+            format!("decimal_sign: 0x{:x}", sign.0)
+        },
+        gimli::AttributeValue::Endianity(endian) => {
+            format!("endianity: 0x{:x}", endian.0)
+        },
+        gimli::AttributeValue::Accessibility(access) => {
+            format!("accessibility: 0x{:x}", access.0)
+        },
+        gimli::AttributeValue::Visibility(vis) => {
+            format!("visibility: 0x{:x}", vis.0)
+        },
+        gimli::AttributeValue::Virtuality(virt) => {
+            format!("virtuality: 0x{:x}", virt.0)
+        },
+        gimli::AttributeValue::CallingConvention(cc) => {
+            format!("calling_convention: 0x{:x}", cc.0)
+        },
+        gimli::AttributeValue::Inline(inline_val) => {
+            format!("inline: 0x{:x}", inline_val.0)
+        },
+        gimli::AttributeValue::Ordering(order) => {
+            format!("ordering: 0x{:x}", order.0)
+        },
+        gimli::AttributeValue::FileIndex(file_idx) => {
+            format!("file_index: {}", file_idx)
+        },
+        gimli::AttributeValue::DebugLineRef(line_ref) => {
+            format!("0x{:x} (.debug_line section offset)", line_ref.0.into_u64())
         },
         _ => "<unhandled>".to_string(),
     };
@@ -962,8 +1583,13 @@ fn dwarf_attr_to_string_with_context_and_base<R: Reader>(
                     Ok(format!("0x{:x}", final_addr))
                 },
                 gimli::AttributeValue::DebugAddrIndex(addr_index) => {
-                    // DWARF 5のアドレスインデックス形式
-                    Ok(format!("addr_index[{:?}] (requires .debug_addr section)", addr_index.0))
+                    // DWARF 5のアドレスインデックス形式 - 独自実装で解決
+                    // コンテキスト関数では簡易的な処理を行う
+                    Ok(format!("addr_index[{:?}] (DWARF5アドレスインデックス)", addr_index.0))
+                },
+                gimli::AttributeValue::DebugLineRef(line_ref) => {
+                    // DW_AT_stmt_listなどの行番号情報参照 - 実際の値を16進数で表示
+                    Ok(format!("0x{:x} (.debug_line section offset)", line_ref.0.into_u64()))
                 },
                 gimli::AttributeValue::Language(lang) => {
                     // 誤って言語として解釈された場合、生の値を取得
@@ -1006,7 +1632,7 @@ fn dwarf_attr_to_string_with_context_and_base<R: Reader>(
             match val {
                 // DWARF 5の新しいフォーム
                 gimli::AttributeValue::DebugStrOffsetsIndex(index) => {
-                    Ok(format!("str_offsets_index[{:?}] (requires .debug_str_offsets)", index.0))
+                    Ok(format!("str_offsets_index[{:?}] (requires __debug_str_offs__DWARF)", index.0))
                 },
                 gimli::AttributeValue::DebugAddrIndex(index) => {
                     Ok(format!("addr_index[{:?}] (requires .debug_addr)", index.0))
@@ -3263,6 +3889,294 @@ fn display_stubs_and_following_section(buffer: &[u8], sections: &HashMap<String,
     }
 }
 
+// DWARF5 __debug_str_offs__DWARFセクション専用の16進ダンプ関数
+fn display_debug_str_offsets_hexdump(buffer: &[u8], section: &SectionInfo) {
+    println!("DWARF5 __debug_str_offs__DWARFセクション 16進ダンプ");
+    println!("セクション: {} (セグメント: {})", section.name, section.seg_name);
+    println!("  ファイルオフセット: 0x{:08x}", section.offset);
+    println!("  サイズ: {} バイト", section.size);
+    
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("  エラー: セクションデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    // DWARF5の文字列オフセットテーブルの構造を解析
+    if section_data.len() < 8 {
+        println!("  エラー: セクションサイズが小さすぎます");
+        return;
+    }
+    
+    // ヘッダー情報を表示
+    println!("\n--- ヘッダー情報 ---");
+    let unit_length = u32::from_le_bytes([
+        section_data[0], section_data[1], section_data[2], section_data[3]
+    ]);
+    let version = u16::from_le_bytes([section_data[4], section_data[5]]);
+    let padding = u16::from_le_bytes([section_data[6], section_data[7]]);
+    
+    println!("  ユニット長: {} バイト (0x{:08x})", unit_length, unit_length);
+    println!("  バージョン: {} (0x{:04x})", version, version);
+    println!("  パディング: 0x{:04x}", padding);
+    
+    // 16進ダンプ表示
+    println!("\n--- 16進ダンプ ---");
+    let max_dump = std::cmp::min(section_data.len(), 1024); // 最大1024バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("    {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    
+    // オフセットテーブルの解釈（8バイト以降）
+    if section_data.len() > 8 {
+        println!("\n--- 文字列オフセットテーブル解釈 ---");
+        let offset_data = &section_data[8..];
+        let mut offset_index = 0;
+        
+        // 4バイト単位でオフセットを読み取り
+        for chunk in offset_data.chunks(4) {
+            if chunk.len() == 4 {
+                let offset = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                println!("  [{}]: 0x{:08x} ({})", offset_index, offset, offset);
+                offset_index += 1;
+                
+                // 最大20個のオフセットを表示
+                if offset_index >= 20 {
+                    break;
+                }
+            }
+        }
+        
+        if offset_data.len() > 80 { // 20 * 4バイト
+            println!("  ... (省略。残り: {} バイト)", offset_data.len() - 80);
+        }
+    }
+    
+    if section_data.len() > max_dump {
+        println!("\n... (16進ダンプ省略。全体: {} バイト)", section_data.len());
+    }
+}
+
+// DWARF __debug_strセクション専用の16進ダンプ関数
+fn display_debug_str_hexdump(buffer: &[u8], section: &SectionInfo) {
+    println!("DWARF __debug_strセクション 16進ダンプ");
+    println!("セクション: {} (セグメント: {})", section.name, section.seg_name);
+    println!("  ファイルオフセット: 0x{:08x}", section.offset);
+    println!("  サイズ: {} バイト", section.size);
+    
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("  エラー: セクションデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    // 16進ダンプ表示
+    println!("\n--- 16進ダンプ ---");
+    let max_dump = std::cmp::min(section_data.len(), 2048); // 最大2048バイト表示
+    for (i, chunk) in section_data[..max_dump].chunks(16).enumerate() {
+        print!("    {:04x}: ", i * 16);
+        for b in chunk {
+            print!("{:02x} ", b);
+        }
+        for _ in 0..(16 - chunk.len()) {
+            print!("   ");
+        }
+        print!(" | ");
+        for b in chunk {
+            let c = if b.is_ascii_graphic() || *b == b' ' { *b as char } else { '.' };
+            print!("{}", c);
+        }
+        println!(" |");
+    }
+    
+    // 文字列解析（NULL終端文字列を抽出）
+    println!("\n--- 文字列解析 ---");
+    let mut string_count = 0;
+    let mut current_offset = 0;
+    let mut current_string = Vec::new();
+    
+    for (i, &byte) in section_data.iter().enumerate() {
+        if byte == 0 {
+            // NULL終端文字列の終了
+            if !current_string.is_empty() {
+                if let Ok(s) = String::from_utf8(current_string.clone()) {
+                    if s.trim().len() > 0 { // 空文字列以外を表示
+                        println!("  [0x{:04x}]: \"{}\"", current_offset, s);
+                        string_count += 1;
+                        
+                        // 最大20個の文字列を表示
+                        if string_count >= 20 {
+                            break;
+                        }
+                    }
+                }
+                current_string.clear();
+            }
+            current_offset = i + 1;
+        } else {
+            if current_string.is_empty() {
+                current_offset = i;
+            }
+            current_string.push(byte);
+        }
+    }
+    
+    // 残りの文字列があれば表示
+    if !current_string.is_empty() && string_count < 20 {
+        if let Ok(s) = String::from_utf8(current_string) {
+            if s.trim().len() > 0 {
+                println!("  [0x{:04x}]: \"{}\"", current_offset, s);
+                string_count += 1;
+            }
+        }
+    }
+    
+    if string_count >= 20 {
+        println!("  ... (省略。最大20個の文字列を表示)");
+    }
+    
+    if section_data.len() > max_dump {
+        println!("\n... (16進ダンプ省略。全体: {} バイト)", section_data.len());
+    }
+    
+    println!("\n文字列総数: {} 個 (表示: {} 個)", 
+             section_data.iter().filter(|&&b| b == 0).count(),
+             string_count);
+}
+
+// DWARF __debug_strセクションの内容を文字列として表示
+fn display_debug_str(buffer: &[u8], section: &SectionInfo) {
+    println!("DWARF __debug_strセクション 文字列表示");
+    println!("セクション: {} (セグメント: {})", section.name, section.seg_name);
+    println!("  ファイルオフセット: 0x{:08x}", section.offset);
+    println!("  サイズ: {} バイト", section.size);
+    
+    let start_offset = section.offset as usize;
+    let section_size = section.size as usize;
+    if start_offset >= buffer.len() || section_size == 0 {
+        println!("  エラー: セクションデータが無効です");
+        return;
+    }
+    
+    let actual_end = std::cmp::min(start_offset + section_size, buffer.len());
+    let section_data = &buffer[start_offset..actual_end];
+    
+    println!("\n--- 文字列一覧 ---");
+    let mut string_count = 0;
+    let mut current_offset = 0;
+    let mut current_string = Vec::new();
+    let mut total_strings = 0;
+    
+    // 全ての文字列を抽出
+    let mut all_strings = Vec::new();
+    
+    for (i, &byte) in section_data.iter().enumerate() {
+        if byte == 0 {
+            // NULL終端文字列の終了
+            if !current_string.is_empty() {
+                if let Ok(s) = String::from_utf8(current_string.clone()) {
+                    if s.trim().len() > 0 { // 空文字列以外を記録
+                        all_strings.push((current_offset, s));
+                        total_strings += 1;
+                    }
+                }
+                current_string.clear();
+            }
+            current_offset = i + 1;
+        } else {
+            if current_string.is_empty() {
+                current_offset = i;
+            }
+            current_string.push(byte);
+        }
+    }
+    
+    // 残りの文字列があれば追加
+    if !current_string.is_empty() {
+        if let Ok(s) = String::from_utf8(current_string) {
+            if s.trim().len() > 0 {
+                all_strings.push((current_offset, s));
+                total_strings += 1;
+            }
+        }
+    }
+    
+    // 文字列を表示（最大50個）
+    for (offset, string) in all_strings.iter().take(50) {
+        println!("  [0x{:04x}]: \"{}\"", offset, string);
+        string_count += 1;
+    }
+    
+    if total_strings > 50 {
+        println!("  ... (省略。残り {} 個の文字列)", total_strings - 50);
+    }
+    
+    // 統計情報
+    println!("\n--- 統計情報 ---");
+    println!("  文字列総数: {} 個", total_strings);
+    println!("  表示数: {} 個", string_count);
+    
+    // 長い文字列トップ5を表示
+    let mut long_strings: Vec<_> = all_strings.iter()
+        .filter(|(_, s)| s.len() > 20)
+        .collect();
+    long_strings.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    
+    if !long_strings.is_empty() {
+        println!("\n--- 長い文字列 (トップ5) ---");
+        for (offset, string) in long_strings.iter().take(5) {
+            let display_str = if string.len() > 80 {
+                format!("{}...", &string[..77])
+            } else {
+                string.clone()
+            };
+            println!("  [0x{:04x}] ({} 文字): \"{}\"", offset, string.len(), display_str);
+        }
+    }
+    
+    // 文字列の種類を分析
+    let mut compiler_strings = 0;
+    let mut path_strings = 0;
+    let mut function_strings = 0;
+    
+    for (_, string) in &all_strings {
+        let lower = string.to_lowercase();
+        if lower.contains("clang") || lower.contains("gcc") || lower.contains("compiler") {
+            compiler_strings += 1;
+        } else if string.contains("/") || string.contains("\\") {
+            path_strings += 1;
+        } else if lower.contains("func") || lower.contains("main") || lower.contains("init") {
+            function_strings += 1;
+        }
+    }
+    
+    println!("\n--- 文字列分類 ---");
+    println!("  コンパイラ関連: {} 個", compiler_strings);
+    println!("  パス関連: {} 個", path_strings);
+    println!("  関数関連: {} 個", function_strings);
+    println!("  その他: {} 個", total_strings - compiler_strings - path_strings - function_strings);
+}
+
 fn display_section_hexdump(buffer: &[u8], section: &SectionInfo) {
     println!("セクション: {} (セグメント: {})", section.name, section.seg_name);
     println!("  ファイルオフセット: 0x{:08x}", section.offset);
@@ -4096,14 +5010,14 @@ fn parse_dwarf2_4_file_table(data: &[u8], offset: &mut usize) -> (Vec<String>, V
     (directories, file_names)
 }
 
-// DWARF 5の__debug_str_offsetsセクションを解析
+// DWARF 5の__debug_str_offs__DWARFセクションを解析
 fn parse_and_display_debug_str_offsets(buffer: &[u8], section: &SectionInfo) {
-    println!("\n=== __debug_str_offsets 詳細解析 ===");
+    println!("\n=== __debug_str_offs__DWARF 詳細解析 ===");
     let start_offset = section.offset as usize;
     let section_size = section.size as usize;
     
     if start_offset >= buffer.len() || section_size == 0 {
-        println!("エラー: __debug_str_offsetsセクションのデータが無効です");
+        println!("エラー: __debug_str_offs__DWARFセクションのデータが無効です");
         return;
     }
     
