@@ -74,6 +74,44 @@ impl CpuArchitecture {
             CpuArchitecture::Unknown(_) => "unknown",
         }
     }
+    
+    /// アーキテクチャの詳細説明を取得
+    fn description(&self) -> &'static str {
+        match self {
+            CpuArchitecture::X86_64 => "Intel x86-64 (64-bit)",
+            CpuArchitecture::ARM64 => "ARM64 (Apple Silicon / AArch64)",
+            CpuArchitecture::ARM32 => "ARM32 (32-bit ARM)",
+            CpuArchitecture::Unknown(_) => "Unknown architecture",
+        }
+    }
+    
+    /// CPUタイプの名前を取得
+    fn cpu_type_name(&self) -> &'static str {
+        match self {
+            CpuArchitecture::X86_64 => "CPU_TYPE_X86_64",
+            CpuArchitecture::ARM64 => "CPU_TYPE_ARM64",
+            CpuArchitecture::ARM32 => "CPU_TYPE_ARM",
+            CpuArchitecture::Unknown(_) => "CPU_TYPE_UNKNOWN",
+        }
+    }
+    
+    /// 対応する逆アセンブラがあるかチェック
+    fn has_disassembler(&self) -> bool {
+        match self {
+            CpuArchitecture::X86_64 | CpuArchitecture::ARM64 | CpuArchitecture::ARM32 => true,
+            CpuArchitecture::Unknown(_) => false,
+        }
+    }
+    
+    /// 命令の標準長を取得（バイト）
+    fn instruction_alignment(&self) -> usize {
+        match self {
+            CpuArchitecture::X86_64 => 1, // 可変長
+            CpuArchitecture::ARM64 => 4,  // 固定4バイト
+            CpuArchitecture::ARM32 => 4,  // 固定4バイト（Thumbは2バイトだが簡略化）
+            CpuArchitecture::Unknown(_) => 4,
+        }
+    }
 }
 
 /// Fat Binaryから適切なアーキテクチャを選択してMach-Oバイナリを抽出
@@ -223,9 +261,10 @@ fn main() -> io::Result<()> {
         println!("使用法: tsudump <ファイルパス> <コマンド>");
         println!("コマンド:");
         println!("  --header: Mach-Oヘッダ情報を表示");
+        println!("  --arch: アーキテクチャ情報を詳細表示");
         println!("  --segments: セグメント情報を表示");
         println!("  --symbols: シンボルテーブルを表示");
-        println!("  --disassemble: __textセクションを逆アセンブル");
+        println!("  --disassemble: __textセクションを逆アセンブル（アーキテクチャ自動判別）");
         println!("  --dump-data: __dataセクションをダンプ");
         println!("  --debug-info: __debug_infoセクションを解析 (DWARF 2-5対応)");
         println!("  --debug-abbrev: __debug_abbrevセクションを解析 (DWARF 2-5対応)");
@@ -288,6 +327,43 @@ fn main() -> io::Result<()> {
     };
 
     match command.as_str() {
+        "--arch" => {
+            // アーキテクチャ情報を詳細表示
+            match macho_header {
+                MachHeader::Header64(header64) => {
+                    let arch = CpuArchitecture::from_mach_cputype(header64.cputype);
+                    println!("\n=== アーキテクチャ情報 ===");
+                    println!("アーキテクチャ: {} - {}", arch.name(), arch.description());
+                    println!("CPUタイプ: {} (0x{:08x})", arch.cpu_type_name(), header64.cputype as u32);
+                    println!("CPUサブタイプ: {} (0x{:08x})", header64.cpusubtype, header64.cpusubtype);
+                    println!("命令アライメント: {} バイト", arch.instruction_alignment());
+                    println!("逆アセンブル対応: {}", if arch.has_disassembler() { "✅ 対応" } else { "❌ 未対応" });
+                    
+                    // ファイルタイプ情報も表示
+                    let filetype_str = match header64.filetype {
+                        1 => "MH_OBJECT (オブジェクトファイル)",
+                        2 => "MH_EXECUTE (実行可能ファイル)",
+                        6 => "MH_DYLIB (動的ライブラリ)",
+                        8 => "MH_BUNDLE (バンドル)",
+                        10 => "MH_DSYM (デバッグシンボル)",
+                        _ => "その他",
+                    };
+                    println!("ファイルタイプ: {} ({})", header64.filetype, filetype_str);
+                    println!("フラグ: 0x{:08x}", header64.flags);
+                },
+                MachHeader::Header32(header32) => {
+                    let arch = CpuArchitecture::from_mach_cputype(header32.cputype);
+                    println!("\n=== アーキテクチャ情報 (32-bit) ===");
+                    println!("アーキテクチャ: {} - {}", arch.name(), arch.description());
+                    println!("CPUタイプ: {} (0x{:08x})", arch.cpu_type_name(), header32.cputype as u32);
+                    println!("CPUサブタイプ: {} (0x{:08x})", header32.cpusubtype, header32.cpusubtype);
+                    println!("命令アライメント: {} バイト", arch.instruction_alignment());
+                    println!("逆アセンブル対応: {}", if arch.has_disassembler() { "✅ 対応" } else { "❌ 未対応" });
+                    println!("⚠️  注意: 32-bit Mach-Oの逆アセンブルは現在未対応です");
+                }
+            }
+            return Ok(());
+        },
         "--cstring" => {
             match find_section_by_name(&sections, "__cstring") {
                 Some(section) => display_cstring_section(&actual_buffer, section),
@@ -346,11 +422,24 @@ fn main() -> io::Result<()> {
         "--disassemble" => {
             if let Some(text_section) = find_section_by_name(&sections, "__text") {
                 match macho_header {
-                    MachHeader::Header64(header64) => disassemble_text_section(&actual_buffer, text_section, header64),
-                    MachHeader::Header32(_) => println!("32ビットMach-Oの逆アセンブルは未対応です。"),
+                    MachHeader::Header64(header64) => {
+                        let arch = CpuArchitecture::from_mach_cputype(header64.cputype);
+                        if arch.has_disassembler() {
+                            disassemble_text_section(&actual_buffer, text_section, header64);
+                        } else {
+                            println!("❌ アーキテクチャ {} ({}) は逆アセンブルに対応していません", arch.name(), arch.description());
+                            println!("対応アーキテクチャ: x86_64, ARM64, ARM32");
+                        }
+                    },
+                    MachHeader::Header32(header32) => {
+                        let arch = CpuArchitecture::from_mach_cputype(header32.cputype);
+                        println!("❌ 32-bit Mach-O ({} - {}) の逆アセンブルは現在未対応です", arch.name(), arch.description());
+                        println!("64-bit版のバイナリをご利用ください");
+                    },
                 }
             } else {
-                println!("__textセクションが見つかりません");
+                println!("❌ __textセクションが見つかりません");
+                println!("このファイルには実行可能コードが含まれていない可能性があります");
             }
         },
         "--dump-data" => {
@@ -1844,7 +1933,15 @@ fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &mach_
     
     // CPUアーキテクチャを判定
     let arch = CpuArchitecture::from_mach_cputype(header.cputype);
-    println!("アーキテクチャ: {} (cputype: {} / 0x{:08x})", arch.name(), header.cputype, header.cputype);
+    println!("アーキテクチャ: {} - {}", arch.name(), arch.description());
+    println!("CPUタイプ: {} (0x{:08x})", arch.cpu_type_name(), header.cputype as u32);
+    println!("命令アライメント: {} バイト", arch.instruction_alignment());
+    
+    if !arch.has_disassembler() {
+        println!("⚠️  未対応アーキテクチャです。逆アセンブルをスキップします。");
+        return;
+    }
+    
     println!("{}", "=".repeat(80));
 
     let start_offset = section.offset as usize;
@@ -1872,7 +1969,7 @@ fn disassemble_text_section(buffer: &[u8], section: &SectionInfo, header: &mach_
                 simple_disasm_arm32(&buffer[i..actual_end], addr)
             },
             CpuArchitecture::Unknown(cputype) => {
-                (format!("不明なアーキテクチャ: {} (cputype: 0x{:x})", arch.name(), cputype), 4)
+                (format!("不明なアーキテクチャ: {} (cputype: 0x{:x}) - 逆アセンブル不可", arch.name(), cputype), arch.instruction_alignment())
             },
         };
 
