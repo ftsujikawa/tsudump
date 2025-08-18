@@ -391,7 +391,18 @@ fn main() -> io::Result<()> {
         }
         "--stubs" => {
             match find_section_by_name(&sections, "__stubs") {
-                Some(section) => display_stubs_section(&actual_buffer, section, is_64),
+                Some(section) => {
+                    match macho_header {
+                        MachHeader::Header64(header64) => {
+                            let arch = CpuArchitecture::from_mach_cputype(header64.cputype);
+                            display_stubs_section(&actual_buffer, section, arch);
+                        }
+                        MachHeader::Header32(header32) => {
+                            let arch = CpuArchitecture::from_mach_cputype(header32.cputype);
+                            display_stubs_section(&actual_buffer, section, arch);
+                        }
+                    }
+                }
                 None => println!("__stubsセクションは無効です"),
             }
             return Ok(());
@@ -4317,14 +4328,9 @@ fn display_got_section(buffer: &[u8], section: &SectionInfo) {
     display_section_hexdump(buffer, section);
 }
 
-fn display_stubs_section(buffer: &[u8], section: &SectionInfo, is_64: bool) {
-    if is_64 {
-        println!("\n=== __stubs セクション内容 (64ビットバイナリ) ===");
-        println!("※ オフセット解釈は32ビット(u32, 4バイト単位)固定です");
-    } else {
-        println!("\n=== __stubs セクション内容 (32ビットバイナリ) ===");
-        println!("※ オフセット解釈は32ビット(u32, 4バイト単位)です");
-    }
+fn display_stubs_section(buffer: &[u8], section: &SectionInfo, arch: CpuArchitecture) {
+    println!("\n=== __stubs セクション内容 (arch: {}) ===", arch.name());
+    println!("※ オフセット解釈は32ビット(u32, 4バイト単位)固定です");
     let start_offset = section.offset as usize;
     let section_size = section.size as usize;
     if start_offset >= buffer.len() || section_size == 0 {
@@ -4379,39 +4385,84 @@ fn display_stubs_section(buffer: &[u8], section: &SectionInfo, is_64: bool) {
 
     // --- __stubs命令列の簡易解析 ---
     println!("\n[__stubs命令列の簡易解析]");
-    // Mach-Oヘッダからアーキテクチャ判定（x86_64/arm64のみ対応）
-    // ※本来はheaderからcputypeを渡すのが理想だが、ここではバイト長から推定
-    // x86_64: 6バイト単位、arm64: 12バイト単位が多い
-    // まずx86_64パターン
-    let mut addr = section.addr;
-    let mut offset = 0;
-    while offset + 6 <= section_data.len() {
-        // x86_64: ff 25 xx xx xx xx (jmp *rip+xx)
-        if section_data[offset] == 0xff && section_data[offset+1] == 0x25 {
-            let disp = u32::from_le_bytes([section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5]]);
-            println!("  0x{:08x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}    jmp QWORD PTR [rip+0x{:x}]", addr, section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5], disp);
-            offset += 6;
-            addr += 6;
-            continue;
-        }
-        // ARM64: adrp/add/ldr/brパターン（12バイト）
-        if offset + 12 <= section_data.len() {
-            // 例: adrp, add, ldr, br
-            let adrp = u32::from_le_bytes([section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3]]);
-            let _add  = u32::from_le_bytes([section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7]]);
-            let ldr  = u32::from_le_bytes([section_data[offset+8], section_data[offset+9], section_data[offset+10], section_data[offset+11]]);
-            // 簡易判定: adrp命令は上位8bitが0x90~0x91、ldr命令は0xf9
-            if (adrp & 0x9f000000) == 0x90000000 && (ldr & 0xff000000) == 0xf9000000 {
-                println!("  0x{:08x}: {:02x}...{:02x}    ARM64スタブ(adrp/add/ldr): 12バイト", addr, section_data[offset], section_data[offset+11]);
-                offset += 12;
-                addr += 12;
-                continue;
+    match arch {
+        CpuArchitecture::X86_64 => {
+            let mut addr = section.addr;
+            let mut offset = 0usize;
+            while offset < section_data.len() {
+                if offset + 6 <= section_data.len() && section_data[offset] == 0xff && section_data[offset+1] == 0x25 {
+                    let disp = u32::from_le_bytes([
+                        section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5]
+                    ]) as u64;
+                    let target = addr + 6 + disp;
+                    println!(
+                        "  0x{:016x}: ff 25 {:02x} {:02x} {:02x} {:02x}    ; jmp QWORD PTR [rip+0x{:x}] -> [0x{:016x}]",
+                        addr,
+                        section_data[offset+2], section_data[offset+3], section_data[offset+4], section_data[offset+5],
+                        disp, target
+                    );
+                    offset += 6;
+                    addr += 6;
+                    continue;
+                }
+                // その他: バイトを表示
+                println!("  0x{:016x}: {:02x}", addr, section_data[offset]);
+                offset += 1;
+                addr += 1;
             }
         }
-        // それ以外はバイト表示のみ
-        println!("  0x{:08x}: {:02x}", addr, section_data[offset]);
-        offset += 1;
-        addr += 1;
+        CpuArchitecture::ARM64 => {
+            let mut addr = section.addr;
+            let mut offset = 0usize;
+            // ARM64は4バイト(32bit)命令固定
+            while offset + 4 <= section_data.len() {
+                // 先に一般的なスタブの4命令(16バイト)をまとめて検出
+                if offset + 16 <= section_data.len() {
+                    let adrp = u32::from_le_bytes([section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3]]);
+                    let add  = u32::from_le_bytes([section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7]]);
+                    let ldr  = u32::from_le_bytes([section_data[offset+8], section_data[offset+9], section_data[offset+10], section_data[offset+11]]);
+                    let br   = u32::from_le_bytes([section_data[offset+12], section_data[offset+13], section_data[offset+14], section_data[offset+15]]);
+                    let is_adrp = (adrp & 0x9f00_0000) == 0x9000_0000; // ADRP
+                    let is_add  = (add  & 0xffc0_0000) == 0x9100_0000; // ADD (immediate)
+                    let is_ldr  = (ldr  & 0xff00_0000) == 0xf900_0000; // LDR (unsigned offset, 64-bit)
+                    let is_br   = (br   & 0xffff_fc1f) == 0xd61f_0000; // BR Xn
+                    if is_adrp && is_add && is_ldr && is_br {
+                        println!(
+                            "  0x{:016x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}    ; ARM64 stub: adrp; add; ldr; br",
+                            addr,
+                            section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3],
+                            section_data[offset+4], section_data[offset+5], section_data[offset+6], section_data[offset+7],
+                            section_data[offset+8], section_data[offset+9], section_data[offset+10], section_data[offset+11],
+                            section_data[offset+12], section_data[offset+13], section_data[offset+14], section_data[offset+15]
+                        );
+                        offset += 16;
+                        addr += 16;
+                        continue;
+                    }
+                }
+                // 単発命令の簡易表示
+                let ins = u32::from_le_bytes([section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3]]);
+                let mnem = if (ins & 0x9f00_0000) == 0x9000_0000 { "adrp" }
+                           else if (ins & 0xffc0_0000) == 0x9100_0000 { "add" }
+                           else if (ins & 0xff00_0000) == 0xf900_0000 { "ldr" }
+                           else if (ins & 0xffff_fc1f) == 0xd61f_0000 { "br" }
+                           else { "(unknown)" };
+                println!(
+                    "  0x{:016x}: {:02x} {:02x} {:02x} {:02x}    ; {}",
+                    addr, section_data[offset], section_data[offset+1], section_data[offset+2], section_data[offset+3], mnem
+                );
+                offset += 4;
+                addr += 4;
+            }
+        }
+        _ => {
+            println!("  (このアーキテクチャの逆アセンブルは簡易表示のみ)");
+            let mut addr = section.addr;
+            for b in section_data.iter() {
+                println!("  0x{:016x}: {:02x}", addr, *b);
+                addr += 1;
+            }
+        }
     }
 }
 
